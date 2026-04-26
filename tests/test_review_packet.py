@@ -30,6 +30,9 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertEqual(record["input"]["line_id"], "CIV_doublet")
         self.assertGreater(record["window_summary"]["n_good_pixels"], 0)
         self.assertTrue(record["absorber_hypothesis_check"]["candidate_absorber_reasonable"])
+        self.assertTrue(record["human_adjudication"]["required"])
+        self.assertIn("velocity_exceeds_virial_expectation", record["human_adjudication"]["escalation_flags"])
+        self.assertEqual(record["candidate_results"], [])
 
         suggestion = record["task_a_rule_suggestion"]
         self.assertEqual(suggestion["task"], "local_mask_continuum")

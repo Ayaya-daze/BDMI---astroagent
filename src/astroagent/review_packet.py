@@ -165,6 +165,29 @@ def assess_absorber_hypothesis(window: pd.DataFrame, window_metadata: dict[str, 
     }
 
 
+def human_adjudication_policy() -> dict[str, Any]:
+    """Describe scientific decisions that should stay in the human review loop."""
+    return {
+        "required": True,
+        "agent_role": "organize_evidence_not_final_science_judge",
+        "human_decision_fields": [
+            "final_system_acceptance",
+            "physical_interpretation",
+            "outflow_or_intervening_class",
+            "cross_element_consistency",
+        ],
+        "escalation_flags": [
+            "velocity_exceeds_virial_expectation",
+            "cross_element_inconsistency",
+            "single_line_only",
+            "blend_or_contamination",
+            "ambiguous_redshift_solution",
+            "low_snr_or_bad_pixels",
+        ],
+        "candidate_result_policy": "preserve_all_candidate_measurements_for_review",
+    }
+
+
 def _contiguous_intervals(wavelength: np.ndarray, selected: np.ndarray) -> list[list[float]]:
     intervals: list[list[float]] = []
     if len(wavelength) == 0 or not selected.any():
@@ -242,12 +265,17 @@ def build_review_record(
         "input": window_metadata,
         "window_summary": summarize_window(window),
         "absorber_hypothesis_check": assess_absorber_hypothesis(window, window_metadata),
+        "human_adjudication": human_adjudication_policy(),
+        "candidate_results": [],
         "task_a_rule_suggestion": suggest_task_a_labels(window),
         "human_review": {
             "status": "needs_review",
             "reviewer": "",
             "notes": "",
             "absorber_hypothesis_notes": "",
+            "final_system_acceptance": None,
+            "physical_interpretation": None,
+            "cross_element_consistency": None,
             "accepted_task_a": None,
             "corrected_task_a": None,
         },
@@ -277,7 +305,7 @@ def write_review_packet(record: dict[str, Any], window: pd.DataFrame, output_dir
                 "- `*.review.json`：一条结构化样本，留给人工审查和修正。",
                 "- `*.window.csv`：局域观测波长谱窗。",
                 "",
-                "先看 `absorber_hypothesis_check` 和 rule suggestion，再填写 `human_review.notes`、",
+                "先看 `absorber_hypothesis_check`、`candidate_results` 和 rule suggestion，再填写 `human_review.notes`、",
                 "`human_review.accepted_task_a` 或 `human_review.corrected_task_a`。",
                 "",
             ]

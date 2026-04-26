@@ -26,6 +26,8 @@ lambda_obs = lambda_rest * (1 + z_sys)
 
 重要约束：quasar 吸收线不是按固定规律必然出现。即使给定 `line_id` 和 `z_sys`，模型也必须判断局域谱窗中的吸收谷是否和候选吸收体自洽，例如 doublet 两条线是否同时支持、相对强度是否合理、是否可能只是噪声、sky residual、blend 或错误红移。
 
+更高层的科学解释必须保留人工裁决。例如吸收速度超过 halo virial 速度、不同元素的交叉验证不一致、多个红移系统都能解释同一凹陷时，agent 不直接给最终物理结论，而是输出所有候选测量、冲突 flags、证据摘要和推荐检查项，让人根据完整结果判断。
+
 ### MVP 目标
 
 最小可交付版本优先聚焦 **C IV doublet**，原因是其双线物理约束较明确，适合构造可验证标签与规则奖励。DLA / H I、N V、O VI 可作为后续扩展。
@@ -69,6 +71,16 @@ lambda_obs = lambda_rest * (1 + z_sys)
   "present": true,
   "absorber_reasonable": true,
   "consistency_status": "plausible",
+  "human_review_required": true,
+  "review_flags": ["cross_element_inconsistency"],
+  "candidate_results": [
+    {
+      "candidate_id": "fit_001",
+      "center_shift_kms": -38.0,
+      "n_components": 2,
+      "supported_by": ["CIV_1548", "CIV_1550"]
+    }
+  ],
   "fit_ok": false,
   "next_action": "add_component",
   "preferred_n_components": 2,
@@ -114,6 +126,7 @@ lambda_obs = lambda_rest * (1 + z_sys)
 - 学会局域观测波长空间中的 mask 与 continuum anchor 输出
 - 学会读取速度空间拟合摘要并做结构化决策
 - 学会判断候选吸收峰是否和吸收体假设自洽
+- 遇到物理解释冲突时保留所有候选结果并触发人工审查
 - 输出保守、可验证、低幻觉的领域判断
 
 ### RL

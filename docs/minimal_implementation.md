@@ -61,6 +61,8 @@ python3 scripts/make_review_packet.py \
 - `input`：谱线假设、系统红移、观测中心波长、窗口范围。
 - `window_summary`：像素数、坏像素比例、flux 分位数、粗略 SNR。
 - `absorber_hypothesis_check`：预期线心附近是否有吸收谷，doublet 成员是否相互支持。
+- `human_adjudication`：明确哪些科学裁决必须由人完成，例如 virial velocity 冲突或多元素不一致。
+- `candidate_results`：保留所有候选测量结果；最小版本先为空，后续接拟合器后填充。
 - `task_a_rule_suggestion`：规则方法建议的 mask 和 continuum anchors。
 - `human_review`：留给人工填写接受、拒绝或修正。
 
