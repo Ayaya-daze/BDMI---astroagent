@@ -1,0 +1,29 @@
+{
+  "profiles": {
+    "current-thirdparty-standby": {
+      "description": "Restores the saved working third-party config/auth bundle exactly as captured on this machine.",
+      "snapshot_name": "current-thirdparty-standby",
+      "snapshot_only": true,
+      "provider": {
+        "id": "api111",
+        "name": "api111",
+        "base_url": "https://api.xcode.best/v1",
+        "wire_api": "responses"
+      },
+      "model": "gpt-5-codex",
+      "reasoning_effort": "high",
+      "forced_login_method": "api",
+      "preferred_auth_method": "apikey"
+    },
+    "official-chatgpt-login": {
+      "description": "Switches Codex to the built-in openai provider and prepares a clean ChatGPT login.",
+      "provider_mode": "builtin",
+      "provider_id": "openai",
+      "forced_login_method": "chatgpt",
+      "unset_config_keys": [
+        "preferred_auth_method"
+      ],
+      "clear_auth": true
+    }
+  }
+}
