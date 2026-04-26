@@ -12,6 +12,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.deps/
 
 # Notebooks
 .ipynb_checkpoints/
