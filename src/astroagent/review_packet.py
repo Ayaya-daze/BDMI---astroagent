@@ -92,6 +92,79 @@ def summarize_window(window: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def assess_absorber_hypothesis(window: pd.DataFrame, window_metadata: dict[str, Any]) -> dict[str, Any]:
+    """Check whether expected line centers are supported by absorption-like pixels."""
+    validate_spectrum_table(window)
+    wavelength = window["wavelength"].to_numpy()
+    flux = window["flux"].to_numpy()
+    ivar = window["ivar"].to_numpy()
+    pipeline_mask = window["pipeline_mask"].to_numpy()
+    good = np.isfinite(flux) & np.isfinite(ivar) & (ivar > 0) & (pipeline_mask == 0)
+    continuum_level = float(np.median(flux[good])) if good.any() else float(np.median(flux))
+    noise_level = float(np.median(1.0 / np.sqrt(ivar[good]))) if good.any() else 0.0
+    depth_threshold = max(0.05, 3.0 * noise_level)
+
+    line_checks = []
+    for rest_A, center_A in zip(
+        window_metadata["rest_wavelengths_A"],
+        window_metadata["observed_centers_A"],
+        strict=True,
+    ):
+        half_width_A = center_A * 150.0 / C_KMS
+        local = (wavelength >= center_A - half_width_A) & (wavelength <= center_A + half_width_A) & good
+        if local.any():
+            local_min_flux = float(np.min(flux[local]))
+            depth = max(0.0, continuum_level - local_min_flux)
+            detected = depth >= depth_threshold
+            n_good_pixels = int(local.sum())
+        else:
+            local_min_flux = None
+            depth = 0.0
+            detected = False
+            n_good_pixels = 0
+        line_checks.append(
+            {
+                "rest_wavelength_A": float(rest_A),
+                "observed_center_A": float(center_A),
+                "local_min_flux": local_min_flux,
+                "depth_below_continuum": float(depth),
+                "depth_threshold": float(depth_threshold),
+                "n_good_pixels_near_center": n_good_pixels,
+                "absorption_like": bool(detected),
+            }
+        )
+
+    detected_count = sum(1 for item in line_checks if item["absorption_like"])
+    if len(line_checks) == 1:
+        status = "plausible" if detected_count == 1 else "weak_or_absent"
+        reason = "single expected line has an absorption-like trough" if detected_count == 1 else "expected line center is weak or absent"
+    else:
+        depths = [item["depth_below_continuum"] for item in line_checks]
+        primary_depth = max(depths[0], 1e-6)
+        secondary_ratio = depths[1] / primary_depth if len(depths) > 1 else 0.0
+        ratio_ok = 0.25 <= secondary_ratio <= 1.30
+        if detected_count == len(line_checks) and ratio_ok:
+            status = "plausible"
+            reason = "expected doublet members are both absorption-like with a plausible depth ratio"
+        elif detected_count > 0:
+            status = "needs_review"
+            reason = "only part of the expected absorber pattern is supported"
+        else:
+            status = "weak_or_absent"
+            reason = "expected absorber centers are weak or absent"
+
+    return {
+        "status": status,
+        "candidate_absorber_reasonable": status == "plausible",
+        "detected_expected_lines": int(detected_count),
+        "expected_lines": int(len(line_checks)),
+        "continuum_level": continuum_level,
+        "noise_level": noise_level,
+        "line_checks": line_checks,
+        "rationale": reason,
+    }
+
+
 def _contiguous_intervals(wavelength: np.ndarray, selected: np.ndarray) -> list[list[float]]:
     intervals: list[list[float]] = []
     if len(wavelength) == 0 or not selected.any():
@@ -168,11 +241,13 @@ def build_review_record(
         "source": source,
         "input": window_metadata,
         "window_summary": summarize_window(window),
+        "absorber_hypothesis_check": assess_absorber_hypothesis(window, window_metadata),
         "task_a_rule_suggestion": suggest_task_a_labels(window),
         "human_review": {
             "status": "needs_review",
             "reviewer": "",
             "notes": "",
+            "absorber_hypothesis_notes": "",
             "accepted_task_a": None,
             "corrected_task_a": None,
         },
@@ -202,7 +277,7 @@ def write_review_packet(record: dict[str, Any], window: pd.DataFrame, output_dir
                 "- `*.review.json`：一条结构化样本，留给人工审查和修正。",
                 "- `*.window.csv`：局域观测波长谱窗。",
                 "",
-                "先看 rule suggestion，再填写 `human_review.notes`、",
+                "先看 `absorber_hypothesis_check` 和 rule suggestion，再填写 `human_review.notes`、",
                 "`human_review.accepted_task_a` 或 `human_review.corrected_task_a`。",
                 "",
             ]

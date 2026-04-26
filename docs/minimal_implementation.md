@@ -5,6 +5,7 @@
 它回答三个问题：
 
 - 已知 `line_id` 和 `z_sys` 时，代码能不能切出局域 quasar 吸收谱窗？
+- 预期吸收体模式是否真的被局域谱窗支持，而不是看到一个噪声峰就接受？
 - 工具层能不能给出一个非常朴素的 rule baseline？
 - 结果能不能保存成人类能检查和修改的文件？
 
@@ -59,6 +60,7 @@ python3 scripts/make_review_packet.py \
 
 - `input`：谱线假设、系统红移、观测中心波长、窗口范围。
 - `window_summary`：像素数、坏像素比例、flux 分位数、粗略 SNR。
+- `absorber_hypothesis_check`：预期线心附近是否有吸收谷，doublet 成员是否相互支持。
 - `task_a_rule_suggestion`：规则方法建议的 mask 和 continuum anchors。
 - `human_review`：留给人工填写接受、拒绝或修正。
 

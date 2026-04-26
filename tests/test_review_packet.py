@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from astroagent.review_packet import (
+    assess_absorber_hypothesis,
     build_review_record,
     make_demo_quasar_spectrum,
     observed_wavelength_A,
@@ -28,11 +29,27 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertEqual(record["sample_id"], "unit_demo")
         self.assertEqual(record["input"]["line_id"], "CIV_doublet")
         self.assertGreater(record["window_summary"]["n_good_pixels"], 0)
+        self.assertTrue(record["absorber_hypothesis_check"]["candidate_absorber_reasonable"])
 
         suggestion = record["task_a_rule_suggestion"]
         self.assertEqual(suggestion["task"], "local_mask_continuum")
         self.assertTrue(suggestion["analysis_mask_intervals_A"])
         self.assertGreaterEqual(len(suggestion["continuum_anchor_points_A"]), 3)
+
+    def test_absorber_check_rejects_flat_window(self):
+        spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
+        spectrum["flux"] = 1.0
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="CIV_doublet",
+            z_sys=2.6,
+            sample_id="flat_demo",
+            source={"kind": "unit_test"},
+        )
+
+        check = assess_absorber_hypothesis(window, record["input"])
+        self.assertFalse(check["candidate_absorber_reasonable"])
+        self.assertEqual(check["status"], "weak_or_absent")
 
 
 if __name__ == "__main__":

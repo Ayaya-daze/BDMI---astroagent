@@ -24,6 +24,8 @@ lambda_obs = lambda_rest * (1 + z_sys)
 
 自动切取目标谱线附近的局域谱窗。LLM 不负责从整条光谱中任意识别元素，也不直接替代物理拟合器，而是在工具层结果基础上做结构化分析决策。
 
+重要约束：quasar 吸收线不是按固定规律必然出现。即使给定 `line_id` 和 `z_sys`，模型也必须判断局域谱窗中的吸收谷是否和候选吸收体自洽，例如 doublet 两条线是否同时支持、相对强度是否合理、是否可能只是噪声、sky residual、blend 或错误红移。
+
 ### MVP 目标
 
 最小可交付版本优先聚焦 **C IV doublet**，原因是其双线物理约束较明确，适合构造可验证标签与规则奖励。DLA / H I、N V、O VI 可作为后续扩展。
@@ -65,6 +67,8 @@ lambda_obs = lambda_rest * (1 + z_sys)
   "task": "fit_review",
   "line_id": "CIV_doublet",
   "present": true,
+  "absorber_reasonable": true,
+  "consistency_status": "plausible",
   "fit_ok": false,
   "next_action": "add_component",
   "preferred_n_components": 2,
@@ -109,6 +113,7 @@ lambda_obs = lambda_rest * (1 + z_sys)
 - 遵守固定 JSON schema
 - 学会局域观测波长空间中的 mask 与 continuum anchor 输出
 - 学会读取速度空间拟合摘要并做结构化决策
+- 学会判断候选吸收峰是否和吸收体假设自洽
 - 输出保守、可验证、低幻觉的领域判断
 
 ### RL
