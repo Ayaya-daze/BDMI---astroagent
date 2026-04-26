@@ -1,0 +1,43 @@
+{
+  "CIV_1548": {
+    "family": "CIV",
+    "rest_wavelength_A": 1548.204,
+    "role": "doublet_member",
+    "partner_line_id": "CIV_1550"
+  },
+  "CIV_1550": {
+    "family": "CIV",
+    "rest_wavelength_A": 1550.781,
+    "role": "doublet_member",
+    "partner_line_id": "CIV_1548"
+  },
+  "CIV_doublet": {
+    "family": "CIV",
+    "rest_wavelengths_A": [1548.204, 1550.781],
+    "primary_rest_wavelength_A": 1548.204,
+    "role": "doublet"
+  },
+  "HI_LYA": {
+    "family": "HI",
+    "rest_wavelength_A": 1215.6701,
+    "role": "single_line"
+  },
+  "MGII_2796": {
+    "family": "MGII",
+    "rest_wavelength_A": 2796.352,
+    "role": "doublet_member",
+    "partner_line_id": "MGII_2803"
+  },
+  "MGII_2803": {
+    "family": "MGII",
+    "rest_wavelength_A": 2803.531,
+    "role": "doublet_member",
+    "partner_line_id": "MGII_2796"
+  },
+  "MGII_doublet": {
+    "family": "MGII",
+    "rest_wavelengths_A": [2796.352, 2803.531],
+    "primary_rest_wavelength_A": 2796.352,
+    "role": "doublet"
+  }
+}

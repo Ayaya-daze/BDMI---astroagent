@@ -77,7 +77,9 @@ lambda_obs = lambda_rest * (1 + z_sys)
 
 ## 数据计划
 
-数据来源暂定为 DESI quasar spectra 及相关 DLA / absorption catalog。
+数据来源暂定为 DESI quasar spectra 及相关 DLA / absorption catalog。详细数据源边界见 [docs/data_sources.md](/Users/mac/Desktop/BDMI/astro/docs/data_sources.md)。
+
+本项目的 C IV 与 H I 路线都限定在 **quasar 光谱 / quasar sightline** 上。这里的 H I 默认指背景 quasar 光中的 Ly alpha / DLA 吸收系统，不混入普通恒星或星系光谱任务。
 
 样本构造策略：
 
@@ -206,7 +208,13 @@ Task B 奖励包括：
 - 已拆分两个训练任务：Task A 与 Task B
 - 已确定训练路线：Rule labels / GPT-5.4 teacher -> SFT -> RL
 - 已确定评测路线：结构化指标 + ablation
-- 当前只搭建项目壳子，具体数据管线、schema、训练脚本与评测代码后续逐步实现
+- 已加入最小人工审查包实现：谱线表、局域切窗、rule baseline、JSON/CSV 输出与单元测试
 - 已实测 EGENT 参考代码：direct fitting 正常，CherryIN `openai/gpt-5.4` 可跑通 LLM 视觉复核
 
-下一步应实现数据 schema、局域窗口切取工具、样本构造脚本与离线评测脚本。
+最小实现说明见 [docs/minimal_implementation.md](/Users/mac/Desktop/BDMI/astro/docs/minimal_implementation.md)。可以先运行：
+
+```bash
+python3 scripts/make_review_packet.py
+```
+
+下一步应接入 DESI 小批量 catalog，验证能否从 `TARGETID` 找回 quasar 光谱并生成真实 review packets。
