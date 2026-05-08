@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "external" / "desi_catalogs"
 DEFAULT_VIEWER_DIR = PROJECT_ROOT / "data" / "interim" / "desi_true_positive"
 
@@ -30,8 +30,9 @@ CATALOGS: dict[str, dict[str, Any]] = {
         "score_fields": ["EW_2796", "EW_2803"],
     },
     "CIV": {
-        "catalog_url": "https://data.desi.lbl.gov/public/dr1/vac/dr1/civ-absorber/CIV-Absorbers-dr1-v1.0.fits",
+        "catalog_url": "https://data.desi.lbl.gov/public/dr1/vac/dr1/civ-absorber/v1.0/CIV-Absorbers-dr1-v1.0.fits",
         "extname": "ABSORBER",
+        "metadata_extname": "METADATA",
         "line_id": "CIV_doublet",
         "z_field": "Z_ABS",
         "score_fields": ["CIV_EW_TOTAL"],
@@ -116,7 +117,26 @@ def load_catalog(family: str, cache_dir: str | Path = DEFAULT_CACHE_DIR) -> tupl
     cache_path = Path(cache_dir) / f"{family_key.lower()}_absorber_catalog.fits"
     download_file(catalog_info["catalog_url"], cache_path)
     table = fitsio.read(cache_path, ext=catalog_info["extname"])
+    if "metadata_extname" in catalog_info:
+        metadata = fitsio.read(cache_path, ext=catalog_info["metadata_extname"])
+        table = _merge_structured_arrays(table, metadata)
     return table, cache_path
+
+
+def _merge_structured_arrays(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    if len(left) != len(right):
+        raise ValueError(f"cannot merge catalog HDUs with different lengths: {len(left)} != {len(right)}")
+
+    left_names = left.dtype.names or ()
+    right_names = right.dtype.names or ()
+    extra_names = [name for name in right_names if name not in left_names]
+    dtype = left.dtype.descr + [(name, right.dtype.fields[name][0]) for name in extra_names]
+    merged = np.empty(len(left), dtype=dtype)
+    for name in left_names:
+        merged[name] = left[name]
+    for name in extra_names:
+        merged[name] = right[name]
+    return merged
 
 
 def _row_to_dict(row: np.void) -> dict[str, Any]:

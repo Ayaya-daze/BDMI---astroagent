@@ -111,7 +111,7 @@ LLM 负责：
 
 ### 5.2 LLM 层
 
-下面这层现在在代码里已经有一个最小接口骨架，但完整多轮 agent 编排还没做。
+下面这层现在在代码里已经有一个有界多轮 agent/tool/refit loop。它仍是开发脚手架，长期策略、评测和 RL reward 还没定稿。
 
 LLM/agent 负责：
 
@@ -641,17 +641,17 @@ EGENT 是参考系统，不是本项目主体。
 
 当前代码里已经有的开发切片：
 
-- `review_packet.py`：审查包编排入口
-- `review_continuum.py`：连续谱与局域窗口处理
-- `review_plot.py`：velocity-frame 图和平滑 Voigt 曲线
-- `voigt_fit.py`：第一层 transition-frame peak fit
-- `llm_interface.py`：provider-agnostic LLM client skeleton，包含第一层 `fit_control` 和第二层 `fit_review`
-- `fit_control_record.py`：归一化第一层工具调用，生成可审计 `fit_control_patch`
-- `fit_control_apply.py`：把单轮 `fit_control_patch` 应用回拟合输入，并生成一次 refit 结果和 deterministic gate
+- `review/packet.py`：审查包编排入口
+- `review/continuum.py`：连续谱与局域窗口处理
+- `review/plot.py`：velocity-frame 图和平滑 Voigt 曲线
+- `spectra/voigt_fit.py`：第一层 transition-frame peak fit
+- `agent/llm.py`：provider-agnostic LLM client skeleton，包含第一层 `fit_control` 和第二层 `fit_review`
+- `agent/fit_control.py`：归一化第一层工具调用，生成可审计 `fit_control_patch`，应用回拟合输入，并生成 deterministic refit gate
+- `agent/loop.py`：有界 agent/tool/refit loop，负责跨轮状态、图像输入和候选结果选择
+- `agent/policy.py`：fit-control 与图像/评分共享的小常量
 
 还没形成稳定方案的东西：
 
-- 完整的多轮 agent loop
 - 可长期依赖的批量 refit 策略和质量门限
 - review JSON -> LLM control/review JSON 的真实批处理评测
 - 生产级 provider 配置

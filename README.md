@@ -17,15 +17,15 @@
 
 1. [docs/repo_map.md](docs/repo_map.md)：仓库导航，说明哪些文件是主线、哪些只是参考或产物。
 2. [docs/minimal_implementation.md](docs/minimal_implementation.md)：当前可运行的最小实现。
-3. [src/astroagent/review_packet.py](src/astroagent/review_packet.py)：审查包编排入口。
-4. [src/astroagent/review_continuum.py](src/astroagent/review_continuum.py)：连续谱与局域窗口处理。
-5. [src/astroagent/review_plot.py](src/astroagent/review_plot.py)：拟合模型和诊断图。
-6. [src/astroagent/llm_interface.py](src/astroagent/llm_interface.py)：LLM 接口骨架。
+3. [src/astroagent/review/packet.py](src/astroagent/review/packet.py)：审查包编排入口。
+4. [src/astroagent/review/continuum.py](src/astroagent/review/continuum.py)：连续谱与局域窗口处理。
+5. [src/astroagent/review/plot.py](src/astroagent/review/plot.py)：拟合模型和诊断图。
+6. [src/astroagent/agent/llm.py](src/astroagent/agent/llm.py)：LLM 接口骨架。
 7. [tests/test_review_packet.py](tests/test_review_packet.py)：当前行为边界。
 
 ## 当前阶段
 
-当前仍处于开发和重构阶段，不是定稿版本。现在可运行的是一个最小审查包切片，拟合链路正在按“第一层拟合、第二层分析”拆分。
+当前仍处于开发和重构阶段，不是定稿版本。现在可运行的是一个最小审查包切片，拟合链路正在按“第一层拟合、第二层分析”拆分，并且已经接入有界的 agent/tool/refit loop。
 
 目前可用的开发切片有：
 
@@ -37,10 +37,14 @@
 - 第一层拟合草案：每条 transition 自己建 velocity frame，拟合多个吸收峰
 - 第二层分析接口骨架：后续让 agent 判断同源关系、blend、结构和人工复核需求
 - Task A 的 rule baseline：analysis mask 和 continuum anchors
+- 有界 agent/tool/refit loop：每轮复用同一套 patch schema，输出下一轮是否继续、是否转人工审查
+- 诊断图同时保留观测总览和残差视图，便于 agent 看到全局和局部退化
 - 人工裁决字段：保留最终科学判断给人
 - JSON/CSV 审查包输出
 - ABSpec 风格诊断图：每条 transition 一个速度空间子图，观测谱用 step，模型用平滑 Voigt component/combined 曲线
-- LLM 接口骨架：支持离线 client 和 OpenAI-compatible chat completions；完整多轮 agent loop 仍在开发中
+- LLM 接口骨架：支持离线 client 和 OpenAI-compatible chat completions；有界多轮 agent loop 已接入，策略和评测仍在迭代
+
+最近已经用真实脏数据跑过一批小实验，包括本地 `srt/data` 里的 COS/HI 样本。结论是：数据处理层和 loop 脚手架已经能工作，但具体样本是否继续探索、是否转人工，仍然依赖 gate 和后续模型判断。
 
 下一步主线还是接入 DESI 小批量真实数据，从 `TARGETID` 或 catalog 记录生成可审查的 review packets；实验输出不作为长期资产保留。
 
@@ -80,8 +84,31 @@
   --plot-image outputs/review_packet/demo_CIV_doublet_z2p6000.plot.png
 ```
 
-`offline` client 不联网，只用于验证 schema 和文件链路。真实 provider 使用 `--client openai-compatible`，并通过 `ASTROAGENT_LLM_API_KEY`、`ASTROAGENT_LLM_MODEL`、`ASTROAGENT_LLM_BASE_URL` 配置。
+`offline` client 不联网，只用于验证 schema 和文件链路。真实 provider 使用 `--client openai-compatible`，并通过 `ASTROAGENT_LLM_API_KEY`、`ASTROAGENT_LLM_MODEL`、`ASTROAGENT_LLM_BASE_URL` 或 `ASTROAGENT_LLM_API_URL` 配置。
 `fit_control` 模式会同时输出 `*.fit_control_patch.json`，供后续 refit loop 和 RL 使用。
+
+例如使用 Paratera GLM-4V 兼容接口时，可以在 shell 里临时设置：
+
+```bash
+export ASTROAGENT_LLM_API_KEY='...'
+export ASTROAGENT_LLM_MODEL='GLM-4V-Plus-0111'
+export ASTROAGENT_LLM_BASE_URL='https://llmapi.paratera.com'
+```
+
+运行有界 agent/tool/refit loop：
+
+```bash
+.venv/bin/python scripts/run_fit_control_loop.py \
+  --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
+  --window-csv outputs/review_packet/demo_CIV_doublet_z2p6000.window.csv \
+  --plot-image outputs/review_packet/demo_CIV_doublet_z2p6000.plot.png \
+  --client offline \
+  --max-rounds 3
+```
+
+loop 每轮复用同一套 `fit_control` tool schema、patch 记录和 deterministic refit gate。`offline` client 默认不发工具调用，只验证编排；真实多模态 provider 才会提出 add/update/remove source、mask/window/continuum edits，并触发下一轮 refit。
+
+loop 不是单次 LLM 调用。每轮会把上一轮已经接受或保留的 overrides 作为下一轮输入，并同时给模型提供观测波长空间总览图和 velocity/residual 诊断图。模型可以一轮提出多个 source、window、mask 或 continuum edits；gate 只负责防止明显退化和记录人工复核状态，不负责最终科学裁决。
 
 ## 目录分层
 
@@ -93,7 +120,7 @@
 ├── tests/                   # 最小行为测试
 ├── docs/                    # 项目地图、计划、数据源和参考笔记
 ├── data/                    # 数据占位，不提交大数据
-├── outputs/                 # 生成产物，不作为主线阅读入口
+├── outputs/                 # 临时生成产物，只保留 .gitkeep
 ├── Egent/                   # 外部参考代码，不是本项目主体
 └── BDMI 大作业.pdf          # 原始课程设想
 ```
@@ -107,3 +134,4 @@
 - LLM 接口现在只是一层薄 client，不绑定某一家 provider。
 - 更高层科学解释必须保留人工裁决。
 - 当前代码先保证中间产物可审查，再扩展到 DESI、teacher labels、SFT 和 RL。
+- `outputs/` 里的实验产物默认可清理，不作为长期结果或数据集版本管理位置。

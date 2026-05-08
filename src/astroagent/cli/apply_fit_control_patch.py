@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from astroagent.fit_control_apply import refit_record_with_patch
-from astroagent.review_packet import write_review_packet
+from astroagent.agent.fit_control import refit_record_with_patch
+from astroagent.review.packet import write_review_packet
 
 
 def parse_args() -> argparse.Namespace:

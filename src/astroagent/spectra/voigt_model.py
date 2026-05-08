@@ -119,3 +119,4 @@ def component_optical_depth_model(
     """Legacy toy-model helper kept for old fixtures only."""
     tau = float(tau0) * normalized_voigt_velocity(velocity_kms, center_kms, sigma_kms, gamma_kms)
     return np.exp(-np.clip(tau, 0.0, 80.0))
+

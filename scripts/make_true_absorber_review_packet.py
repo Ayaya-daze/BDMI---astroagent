@@ -13,13 +13,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from astroagent.desi_public import (  # noqa: E402
+from astroagent.data.desi_public import (  # noqa: E402
     catalog_row_summary,
     choose_best_absorbers,
     fetch_viewer_spectrum,
     load_catalog,
 )
-from astroagent.review_packet import build_review_record, write_review_packet  # noqa: E402
+from astroagent.review.packet import build_review_record, write_review_packet  # noqa: E402
 
 
 def _component_summary(fit_result: dict) -> dict[str, str]:

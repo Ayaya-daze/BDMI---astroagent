@@ -122,3 +122,4 @@ def merge_nearby_islands(islands: list[np.ndarray], velocity: np.ndarray, max_ga
         else:
             merged.append(island)
     return merged
+

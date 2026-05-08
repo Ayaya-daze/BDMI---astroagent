@@ -31,6 +31,7 @@ dev = [
 astroagent-make-review-packet = "astroagent.cli.make_review_packet:main"
 astroagent-run-fit-review = "astroagent.cli.run_fit_review:main"
 astroagent-apply-fit-control-patch = "astroagent.cli.apply_fit_control_patch:main"
+astroagent-run-fit-control-loop = "astroagent.cli.run_fit_control_loop:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

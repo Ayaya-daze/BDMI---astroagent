@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CATALOG_PATH = PROJECT_ROOT / "configs" / "line_catalog.json"
 
 
@@ -113,3 +113,4 @@ def transition_definitions(
         }
         for transition_line_id, rest, strength in zip(transition_ids, rests, strengths, strict=True)
     ]
+

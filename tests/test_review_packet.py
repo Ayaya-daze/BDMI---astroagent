@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -11,8 +12,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from astroagent.review_packet import (
+from astroagent.review.packet import (
     assess_absorber_hypothesis,
+    build_fit_control_hints,
     build_plot_data,
     build_plot_and_fit_data,
     build_review_record,
@@ -49,6 +51,8 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertEqual(record["fit_results"][0]["fit_type"], "transition_frame_peak_voigt")
         self.assertEqual(record["fit_results"][0]["fit_method"], "ultranest_physical_transition_frame")
         self.assertEqual(record["fit_results"][0]["n_transition_frames"], 2)
+        self.assertEqual(record["fit_results"][0]["source_work_window_kms"], [-400.0, 400.0])
+        self.assertIn("fit_rms", record["fit_results"][0]["source_work_window_metrics"])
         self.assertIn("transition_frames", record["fit_results"][0])
         components = record["fit_results"][0]["components"]
         self.assertGreaterEqual(len(components), 1)
@@ -96,6 +100,25 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertFalse(check["absorption_signal_present"])
         self.assertEqual(check["status"], "weak_or_absent")
 
+    def test_fit_control_hints_keep_boundary_residuals_below_core_priority(self):
+        velocity = np.array([-250.0, -245.0, 0.0, 388.0, 392.0, 406.0, 410.0])
+        plot_window = pd.DataFrame(
+            {
+                "voigt_transition_id": ["HI_LYA"] * len(velocity),
+                "transition_velocity_kms": velocity,
+                "voigt_residual_sigma": [-5.0, -6.0, 0.0, -7.0, -8.0, -9.0, -10.0],
+                "is_voigt_fit_pixel": [1] * len(velocity),
+            }
+        )
+        fit_summary = {"transition_frames": [{"transition_line_id": "HI_LYA"}]}
+
+        hints = build_fit_control_hints(plot_window, fit_summary)
+
+        kinds = [hint["kind"] for hint in hints["hints"]]
+        self.assertEqual(hints["priority_order"][0], "source_work_window_residual")
+        self.assertIn("source_work_window_residual", kinds)
+        self.assertIn("source_boundary_residual", kinds)
+
     def test_plot_data_and_files_are_written(self):
         spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
         record, window = build_review_record(
@@ -117,6 +140,7 @@ class ReviewPacketTest(unittest.TestCase):
             paths = write_review_packet(record, window, output_dir)
             self.assertTrue(paths["plot_csv"].exists())
             self.assertTrue(paths["model_csv"].exists())
+            self.assertTrue(paths["overview_png"].exists())
             self.assertTrue(paths["plot_png"].exists())
 
             plot_csv = pd.read_csv(paths["plot_csv"])
@@ -138,6 +162,47 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertIn("b_kms", model_csv.columns)
         self.assertIn("damping_gamma_kms", model_csv.columns)
         self.assertTrue({"component", "combined"}.issubset(set(model_csv["curve_kind"])))
+
+    def test_write_review_packet_is_repeatable_and_keeps_json_model_consistent(self):
+        spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="CIV_doublet",
+            z_sys=2.6,
+            sample_id="repeatable_packet",
+            source={"kind": "unit_test"},
+        )
+
+        with tempfile.TemporaryDirectory(prefix="astroagent_review_repeatable_") as output_dir:
+            write_review_packet(record, window, output_dir)
+            self.assertIn("_plot_window", record)
+            self.assertIn("_fit_summary", record)
+
+            paths = write_review_packet(record, window, output_dir)
+            saved = json.loads(paths["json"].read_text(encoding="utf-8"))
+            model_csv = pd.read_csv(paths["model_csv"])
+            reloaded_paths = write_review_packet(saved, window, output_dir)
+            reloaded_model_csv = pd.read_csv(reloaded_paths["model_csv"])
+
+        json_centers = sorted(
+            round(float(component["center_velocity_kms"]), 3)
+            for component in saved["fit_results"][0]["components"]
+        )
+        model_centers = sorted(
+            round(float(center), 3)
+            for center in model_csv.loc[model_csv["curve_kind"] == "component", "center_velocity_kms"].dropna().unique()
+        )
+        self.assertEqual(model_centers, json_centers)
+        reloaded_model_centers = sorted(
+            round(float(center), 3)
+            for center in reloaded_model_csv.loc[
+                reloaded_model_csv["curve_kind"] == "component",
+                "center_velocity_kms",
+            ].dropna().unique()
+        )
+        self.assertEqual(reloaded_model_centers, json_centers)
+        self.assertNotIn("_plot_window", saved)
+        self.assertNotIn("_fit_summary", saved)
 
     def test_voigt_fit_recovers_demo_absorption_components(self):
         spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
@@ -207,6 +272,46 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertTrue(any(abs(center - 135.0) < 55.0 for center in centers))
         self.assertTrue(plot_window["voigt_model"].notna().any())
         self.assertLessEqual(max(abs(center) for center in centers), 700.0)
+
+    def test_voigt_fit_merges_nearly_duplicate_explicit_sources(self):
+        z_sys = 0.0
+        rest_A = 2796.352
+        wavelength = np.arange(rest_A - 3.0, rest_A + 3.0, 0.08)
+        velocity = (wavelength / rest_A - 1.0) * 299792.458
+        flux = 1.0 - 0.35 * np.exp(-0.5 * (velocity / 18.0) ** 2)
+        spectrum = pd.DataFrame(
+            {
+                "wavelength": wavelength,
+                "flux": flux,
+                "ivar": np.full_like(wavelength, 900.0),
+                "pipeline_mask": np.zeros_like(wavelength, dtype=int),
+            }
+        )
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="MGII_2796",
+            z_sys=z_sys,
+            sample_id="duplicate_seed_single_transition",
+            source={"kind": "unit_test"},
+            half_width_kms=320.0,
+        )
+        fit_control = {
+            "source_seeds": [
+                {"transition_line_id": "MGII_2796", "center_velocity_kms": -4.0, "explicit_fit_control_source": True},
+                {"transition_line_id": "MGII_2796", "center_velocity_kms": 5.0, "explicit_fit_control_source": True},
+            ],
+            "fit_mask_intervals": [],
+            "fit_windows": {},
+            "removed_sources": [],
+        }
+        _, _, fit_summary = build_plot_and_fit_data(window, record["input"], fit_control=fit_control)
+
+        centers = sorted(
+            float(peak["center_velocity_kms"])
+            for peak in fit_summary["components"]
+            if peak.get("fit_success") and abs(float(peak["center_velocity_kms"])) < 20.0
+        )
+        self.assertEqual(len(centers), 1)
 
     def test_voigt_fit_infers_nonzero_absorber_velocity(self):
         z_catalog = 2.6
@@ -365,6 +470,30 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertEqual(len(corrected_summary["manual_anchor_nodes"]), 1)
         self.assertAlmostEqual(corrected_summary["manual_anchor_nodes"][0]["continuum_flux"], float(true_continuum[center_index]))
         self.assertEqual(removed_summary["removed_anchor_indices"], [len(base_summary["anchor_wavelengths_A"])])
+
+    def test_provided_continuum_column_is_used_for_cos_like_low_flux_data(self):
+        wavelength = np.linspace(1210.0, 1225.0, 64)
+        continuum = np.full_like(wavelength, 3.0e-16, dtype=float)
+        flux = continuum.copy()
+        flux[20:24] *= 0.45
+        spectrum = pd.DataFrame(
+            {
+                "wavelength": wavelength,
+                "flux": flux,
+                "ivar": np.full_like(wavelength, 1.0e28, dtype=float),
+                "pipeline_mask": np.zeros_like(wavelength, dtype=int),
+                "CONTINUUM": continuum,
+            }
+        )
+
+        window, summary = build_plot_data(spectrum)
+
+        self.assertEqual(summary["method"], "input_continuum_column")
+        self.assertTrue(summary["provided_continuum_column"])
+        normalized = window["normalized_flux"].to_numpy(dtype=float)
+        ratio = np.median(normalized[np.isfinite(normalized)])
+        self.assertAlmostEqual(float(ratio), 1.0, places=6)
+        self.assertGreater(float(window["continuum_model"].min()), 0.0)
 
 
 if __name__ == "__main__":

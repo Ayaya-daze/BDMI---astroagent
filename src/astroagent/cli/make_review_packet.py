@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from astroagent.review_packet import (
+from astroagent.review.packet import (
     build_review_record,
     make_demo_quasar_spectrum,
     write_review_packet,

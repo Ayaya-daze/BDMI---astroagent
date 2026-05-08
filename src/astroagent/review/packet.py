@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -8,10 +9,11 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
 
-from astroagent.line_catalog import load_line_catalog, primary_rest_wavelength_A, rest_wavelengths_A, transition_definitions
-from astroagent.review_continuum import C_KMS, build_plot_data, observed_wavelength_A, validate_spectrum_table, velocity_kms
-from astroagent.review_plot import build_smooth_voigt_model_data, save_review_plot
-from astroagent.voigt_fit import fit_voigt_absorption
+from astroagent.spectra.line_catalog import load_line_catalog, primary_rest_wavelength_A, rest_wavelengths_A, transition_definitions
+from astroagent.agent.policy import SOURCE_CORE_WINDOW_KMS, SOURCE_WORK_WINDOW_KMS
+from astroagent.review.continuum import C_KMS, build_plot_data, observed_wavelength_A, validate_spectrum_table, velocity_kms
+from astroagent.review.plot import build_smooth_voigt_model_data, save_review_plot, save_window_overview_plot
+from astroagent.spectra.voigt_fit import fit_voigt_absorption
 
 
 def cut_local_window(
@@ -60,6 +62,7 @@ def cut_local_window(
         "window_min_A": float(window_min),
         "window_max_A": float(window_max),
         "half_width_kms": float(half_width_kms),
+        "catalog_path": str(Path(catalog_path)) if catalog_path is not None else None,
         "post_window_rule": "line metadata defines the coarse observed window and each transition velocity frame only",
     }
     return window.reset_index(drop=True), metadata
@@ -252,6 +255,7 @@ def build_review_record_from_window(
         "human_adjudication": human_adjudication_policy(),
         "fit_results": [{"task": "voigt_profile_fit", **fit_summary}],
         "plot_data": _plot_data_record(sample_id, plot_summary, fit_summary),
+        "fit_control_hints": build_fit_control_hints(plot_window, fit_summary),
         "task_a_rule_suggestion": suggest_task_a_labels(window),
         "human_review": {
             "status": "needs_review",
@@ -282,6 +286,96 @@ def build_review_record_from_window(
     record["_plot_summary"] = plot_summary
     record["_fit_summary"] = fit_summary
     return record
+
+
+def build_fit_control_hints(plot_window: pd.DataFrame, fit_summary: dict[str, Any]) -> dict[str, Any]:
+    """Build deterministic hints for the LLM tool loop from fit residuals."""
+    hints: list[dict[str, Any]] = []
+    if "transition_velocity_kms" not in plot_window.columns or "voigt_residual_sigma" not in plot_window.columns:
+        return {"hints": hints}
+
+    transition_half_width = float(fit_summary.get("transition_half_width_kms", 600.0))
+    for frame in fit_summary.get("transition_frames", []):
+        transition_line_id = str(frame.get("transition_line_id", ""))
+        if not transition_line_id:
+            continue
+        selected = (
+            (plot_window["voigt_transition_id"].astype(str) == transition_line_id)
+            & (plot_window.get("is_voigt_fit_pixel", 0).astype(bool))
+        )
+        if not selected.any():
+            continue
+        frame_data = plot_window.loc[selected].sort_values("transition_velocity_kms")
+        velocity = frame_data["transition_velocity_kms"].to_numpy(dtype=float)
+        residual = frame_data["voigt_residual_sigma"].to_numpy(dtype=float)
+        finite = np.isfinite(velocity) & np.isfinite(residual)
+        strong_negative = finite & (residual <= -3.0)
+        for group in _boolean_groups(strong_negative):
+            if len(group) < 2:
+                continue
+            lower_v = float(np.nanmin(velocity[group]))
+            upper_v = float(np.nanmax(velocity[group]))
+            center = float(np.nanmedian(velocity[group]))
+            width = float(upper_v - lower_v)
+            depth = float(np.nanmin(residual[group]))
+            in_core_window = SOURCE_CORE_WINDOW_KMS[0] <= center <= SOURCE_CORE_WINDOW_KMS[1]
+            touches_work_window = upper_v >= SOURCE_WORK_WINDOW_KMS[0] and lower_v <= SOURCE_WORK_WINDOW_KMS[1]
+            in_boundary_band = touches_work_window and not in_core_window
+            kind = (
+                "source_work_window_residual"
+                if in_core_window
+                else ("source_boundary_residual" if in_boundary_band else "context_only_residual")
+            )
+            suggested_action = "consider add_absorption_source or update_absorption_source"
+            payload: dict[str, Any] = {
+                "kind": kind,
+                "transition_line_id": transition_line_id,
+                "center_velocity_kms": center,
+                "velocity_range_kms": [lower_v, upper_v],
+                "width_kms": width,
+                "min_residual_sigma": depth,
+                "suggested_action": suggested_action,
+            }
+            if in_boundary_band:
+                pad = max(12.0, min(35.0, 0.5 * width + 8.0))
+                payload.update(
+                    {
+                        "suggested_fit_mask_interval_kms": [center - pad, center + pad],
+                        "suggested_action": "boundary band; either add a boundary source or cover the full contaminant with a narrow set_fit_mask_interval, do not leave it half handled",
+                    }
+                )
+            elif not in_core_window:
+                pad = max(12.0, min(35.0, 0.5 * width + 8.0))
+                payload.update(
+                    {
+                        "kind": "context_only_mask_candidate",
+                        "suggested_fit_mask_interval_kms": [center - pad, center + pad],
+                        "suggested_action": "context only; consider a narrow set_fit_mask_interval exclude only if it contaminates the source work window",
+                    }
+                )
+            hints.append(payload)
+
+    work_hints = [hint for hint in hints if hint["kind"] == "source_work_window_residual"]
+    boundary_hints = [hint for hint in hints if hint["kind"] == "source_boundary_residual"]
+    context_hints = [hint for hint in hints if hint["kind"] not in {"source_work_window_residual", "source_boundary_residual"}]
+    work_hints.sort(key=lambda item: abs(float(item.get("min_residual_sigma", 0.0))), reverse=True)
+    boundary_hints.sort(key=lambda item: abs(float(item.get("min_residual_sigma", 0.0))), reverse=True)
+    context_hints.sort(key=lambda item: abs(float(item.get("min_residual_sigma", 0.0))), reverse=True)
+    selected = [*work_hints[:8], *boundary_hints[:3], *context_hints[:3]]
+    selected.sort(key=lambda item: float(item.get("center_velocity_kms", 0.0)))
+    return {
+        "source_work_window_kms": list(SOURCE_WORK_WINDOW_KMS),
+        "source_core_window_kms": list(SOURCE_CORE_WINDOW_KMS),
+        "priority_order": ["source_work_window_residual", "source_boundary_residual", "context_only_mask_candidate"],
+        "hints": selected,
+    }
+
+
+def _boolean_groups(mask: np.ndarray) -> list[np.ndarray]:
+    indices = np.flatnonzero(mask)
+    if len(indices) == 0:
+        return []
+    return [group for group in np.split(indices, np.where(np.diff(indices) != 1)[0] + 1) if len(group)]
 
 
 def _plot_data_record(sample_id: str, plot_summary: dict[str, Any], fit_summary: dict[str, Any]) -> dict[str, Any]:
@@ -322,6 +416,8 @@ def _plot_data_record(sample_id: str, plot_summary: dict[str, Any], fit_summary:
         ],
         "image_space": "per_transition_velocity_frame",
         "image_file": f"{sample_id}.plot.png",
+        "overview_image_space": "observed_wavelength_window",
+        "overview_image_file": f"{sample_id}.overview.png",
         "model_file": f"{sample_id}.model.csv",
         "continuum_exclusion_intervals_A": plot_summary["continuum_exclusion_intervals_A"],
         "voigt_fit": fit_summary,
@@ -337,30 +433,138 @@ def write_review_packet(record: dict[str, Any], window: pd.DataFrame, output_dir
     plot_csv_path = output_path / f"{record['sample_id']}.plot.csv"
     model_csv_path = output_path / f"{record['sample_id']}.model.csv"
     plot_png_path = output_path / f"{record['sample_id']}.plot.png"
+    overview_png_path = output_path / f"{record['sample_id']}.overview.png"
     readme_path = output_path / "README.md"
 
-    plot_window = record.pop("_plot_window", None)
-    plot_summary = record.pop("_plot_summary", None)
-    fit_summary = record.pop("_fit_summary", None)
+    plot_window = record.get("_plot_window")
+    plot_summary = record.get("_plot_summary")
+    fit_summary = record.get("_fit_summary")
     if plot_window is None or plot_summary is None or fit_summary is None:
-        plot_window, plot_summary, fit_summary = build_plot_and_fit_data(window, record.get("input"))
+        plot_window, plot_summary = build_plot_data(window, record.get("input"))
+        fit_summary = _record_fit_summary(record)
+        if fit_summary is None:
+            plot_window, plot_summary, fit_summary = build_plot_and_fit_data(window, record.get("input"))
+        else:
+            plot_window = _apply_fit_summary_to_plot_window(plot_window, fit_summary)
 
+    public_record = _public_review_record(record)
     with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(record, handle, ensure_ascii=False, indent=2)
+        json.dump(public_record, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
     window.to_csv(csv_path, index=False)
     plot_window.to_csv(plot_csv_path, index=False)
     build_smooth_voigt_model_data(fit_summary).to_csv(model_csv_path, index=False)
-    save_review_plot(record, window, plot_png_path, plot_window=plot_window, plot_summary=plot_summary, fit_summary=fit_summary)
+    save_window_overview_plot(public_record, window, overview_png_path, plot_window=plot_window)
+    save_review_plot(public_record, window, plot_png_path, plot_window=plot_window, plot_summary=plot_summary, fit_summary=fit_summary)
     readme_path.write_text(_review_packet_readme(), encoding="utf-8")
     return {
         "json": json_path,
         "csv": csv_path,
         "plot_csv": plot_csv_path,
         "model_csv": model_csv_path,
+        "overview_png": overview_png_path,
         "plot_png": plot_png_path,
         "readme": readme_path,
     }
+
+
+def _public_review_record(record: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(record)
+    public.pop("_plot_window", None)
+    public.pop("_plot_summary", None)
+    public.pop("_fit_summary", None)
+    return public
+
+
+def _record_fit_summary(record: dict[str, Any]) -> dict[str, Any] | None:
+    for result in record.get("fit_results", []):
+        if result.get("task") == "voigt_profile_fit" or result.get("fit_type"):
+            return result
+    return None
+
+
+def _apply_fit_summary_to_plot_window(plot_window: pd.DataFrame, fit_summary: dict[str, Any]) -> pd.DataFrame:
+    """Attach model/residual columns from a stored public fit summary.
+
+    This fallback is used when a review JSON has been reloaded from disk and no
+    private `_plot_window` cache is available. It keeps rewritten packet images
+    and model CSVs consistent with the public `fit_results` instead of silently
+    rerunning a fresh default fit.
+    """
+    output = plot_window.copy()
+    output["voigt_model"] = np.nan
+    output["voigt_residual"] = np.nan
+    output["voigt_residual_sigma"] = np.nan
+    output["is_voigt_fit_pixel"] = 0
+    output["voigt_component_index"] = -1
+    output["voigt_transition_id"] = ""
+    output["transition_velocity_kms"] = np.nan
+
+    wavelength = output["wavelength"].to_numpy(dtype=float)
+    normalized_flux = output["normalized_flux"].to_numpy(dtype=float)
+    normalized_ivar = output["normalized_ivar"].to_numpy(dtype=float)
+    model_data = build_smooth_voigt_model_data(fit_summary)
+    if model_data.empty:
+        return output
+
+    for frame in fit_summary.get("transition_frames", []):
+        transition_line_id = str(frame.get("transition_line_id", ""))
+        observed_center_A = float(frame.get("observed_center_A", np.nan))
+        if not transition_line_id or not np.isfinite(observed_center_A):
+            continue
+        bounds = frame.get("velocity_frame", {}).get("bounds_kms", [-np.inf, np.inf])
+        try:
+            lower_bound, upper_bound = float(bounds[0]), float(bounds[1])
+        except (TypeError, ValueError, IndexError):
+            lower_bound, upper_bound = -np.inf, np.inf
+        velocity = velocity_kms(wavelength, observed_center_A)
+        frame_mask = np.isfinite(velocity) & (velocity >= lower_bound) & (velocity <= upper_bound)
+        combined_rows = model_data[
+            (model_data["transition_line_id"] == transition_line_id)
+            & (model_data["curve_kind"] == "combined")
+        ].sort_values("transition_velocity_kms")
+        if combined_rows.empty:
+            continue
+        model = np.interp(
+            velocity[frame_mask],
+            combined_rows["transition_velocity_kms"].to_numpy(dtype=float),
+            combined_rows["smooth_voigt_model"].to_numpy(dtype=float),
+            left=np.nan,
+            right=np.nan,
+        )
+        frame_indices = np.flatnonzero(frame_mask)
+        finite_model = np.isfinite(model)
+        target_indices = frame_indices[finite_model]
+        existing = output.loc[target_indices, "voigt_model"].to_numpy(dtype=float)
+        updated_model = model[finite_model]
+        output.loc[target_indices, "voigt_model"] = np.where(
+            np.isfinite(existing),
+            np.minimum(existing, updated_model),
+            updated_model,
+        )
+        output.loc[frame_indices, "voigt_transition_id"] = transition_line_id
+        output.loc[frame_indices, "transition_velocity_kms"] = velocity[frame_mask]
+
+    finite = np.isfinite(output["voigt_model"].to_numpy(dtype=float))
+    output.loc[finite, "is_voigt_fit_pixel"] = 1
+    output.loc[finite, "voigt_residual"] = normalized_flux[finite] - output.loc[finite, "voigt_model"].to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        err = np.where(normalized_ivar > 0.0, 1.0 / np.sqrt(normalized_ivar), np.nan)
+    output.loc[finite, "voigt_residual_sigma"] = output.loc[finite, "voigt_residual"].to_numpy(dtype=float) / err[finite]
+
+    for component in fit_summary.get("components", []):
+        transition_line_id = str(component.get("transition_line_id", ""))
+        center_velocity = float(component.get("center_velocity_kms", np.nan))
+        half_width = float(component.get("fit_window_half_width_kms", fit_summary.get("local_fit_half_width_kms", 180.0)))
+        if not transition_line_id or not np.isfinite(center_velocity) or not np.isfinite(half_width):
+            continue
+        selected = (
+            (output["voigt_transition_id"].astype(str) == transition_line_id)
+            & np.isfinite(output["transition_velocity_kms"].to_numpy(dtype=float))
+            & (np.abs(output["transition_velocity_kms"].to_numpy(dtype=float) - center_velocity) <= half_width)
+        )
+        output.loc[selected, "voigt_component_index"] = int(component.get("component_index", -1))
+    return output
 
 
 def _review_packet_readme() -> str:
@@ -374,7 +578,8 @@ def _review_packet_readme() -> str:
             "- `*.window.csv`：局域观测波长谱窗。",
             "- `*.plot.csv`：画图专用数据，包含连续谱拟合和归一化谱。",
             "- `*.model.csv`：速度空间平滑 Voigt 曲线，`component` 是单峰，`combined` 是同一 transition 内的总模型。",
-            "- `*.plot.png`：每条 transition 一个局部速度坐标子图；不再输出波长空间总览图。",
+            "- `*.overview.png`：观测波长空间的局域窗口总览图，显示 raw flux、continuum、normalized flux 和 transition centers。",
+            "- `*.plot.png`：每条 transition 一个局部速度坐标子图。",
             "",
             "先看 `absorber_hypothesis_check`、`fit_results` 和 rule suggestion，再填写 `human_review.notes`、",
             "`human_review.accepted_task_a` 或 `human_review.corrected_task_a`。",

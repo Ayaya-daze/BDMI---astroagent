@@ -12,13 +12,15 @@
 ## 文件职责
 
 - `configs/line_catalog.json`：谱线常量表。现在包含 C IV、H I Ly alpha、Mg II。
-- `src/astroagent/line_catalog.py`：读取谱线表，负责 `line_id -> transition definitions`。
-- `src/astroagent/review_packet.py`：审查包编排入口，负责切窗、摘要、fit summary 组装、rule baseline、写出审查包。
-- `src/astroagent/review_continuum.py`：连续谱、归一化谱、局域速度坐标和吸收核心 exclusion。
-- `src/astroagent/review_plot.py`：平滑 Voigt 曲线、per-transition velocity-frame 诊断图。
-- `src/astroagent/voigt_fit.py`：第一层 per-transition-frame peak fit。
-- `src/astroagent/llm_interface.py`：两层 LLM 接口骨架；第一层 `fit_control` 看图并输出拟合工具调用，第二层 `fit_review` 做结构复核。
-- `src/astroagent/fit_control_record.py`：把第一层 LLM 工具调用归一化成可审计 patch，后续 refit loop 和 RL reward 使用它。
+- `src/astroagent/spectra/line_catalog.py`：读取谱线表，负责 `line_id -> transition definitions`。
+- `src/astroagent/review/packet.py`：审查包编排入口，负责切窗、摘要、fit summary 组装、rule baseline、写出审查包。
+- `src/astroagent/review/continuum.py`：连续谱、归一化谱、局域速度坐标和吸收核心 exclusion。
+- `src/astroagent/review/plot.py`：平滑 Voigt 曲线、per-transition velocity-frame 诊断图。
+- `src/astroagent/spectra/voigt_fit.py`：第一层 per-transition-frame peak fit。
+- `src/astroagent/agent/llm.py`：两层 LLM 接口骨架；第一层 `fit_control` 看图并输出拟合工具调用，第二层 `fit_review` 做结构复核。
+- `src/astroagent/agent/fit_control.py`：把第一层 LLM 工具调用归一化成可审计 patch，应用到 fitter overrides，并执行 refit gate。
+- `src/astroagent/agent/loop.py`：有界 agent/tool/refit loop，只负责编排每轮 LLM 决策、refit 和状态传递。
+- `src/astroagent/agent/policy.py`：fit-control 与图像/评分共享的小常量。
 - `src/astroagent/cli/make_review_packet.py`：命令行入口，只负责参数解析和调用核心函数。
 - `scripts/make_review_packet.py`：本地开发用包装脚本，不要求先安装包。
 - `tests/test_review_packet.py`：最小单元测试，保证核心流程能跑通。
@@ -87,16 +89,19 @@ outputs/review_packet/
 3. 工具层根据 patch 更新 continuum anchors/masks、fit windows、fit masks 和 source seeds。
 4. 确定性 fitter 重新生成 `*_refit.review.json`、`*_refit.plot.csv`、`*_refit.model.csv` 和 `*_refit.plot.png`。
 5. `fit_control_evaluation` 比较原始 fit 和 refit：失败、RMS 明显变差、组件数暴涨、fit pixel 被 mask 掉太多或 quality 退化时，patch 标记为 `rejected`；仍有 high residual / inspect 信号时标记为 `needs_human_review`；只有无新增警告的改善才自动 `accepted`。
+6. `scripts/run_fit_control_loop.py` 在同一套 patch/refit/gate 上做多轮编排。每轮会继承上一轮已保留的 overrides，LLM 可以一次提出多个 source、window、mask 或 continuum edits。
 
-这还不是完整多轮 agent 编排，也不是定稿拟合方案。它只用于验证第一层大模型能通过工具调用参与拟合输入修正，并为后续 RL 记录 action -> refit result。
+这还不是定稿拟合方案。它只用于验证第一层大模型能通过工具调用参与拟合输入修正，并为后续 RL 记录 action -> refit result。
 
 ## LLM 接口边界
 
-当前开发版已经有 `src/astroagent/llm_interface.py` 和 `src/astroagent/fit_control_record.py`。它们负责：
+当前开发版的 LLM/agent 层由 `src/astroagent/agent/llm.py`、`src/astroagent/agent/fit_control.py` 和 `src/astroagent/agent/loop.py` 组成。它们负责：
 
 - 把 review packet 压缩成 `fit_control` prompt messages，并可附带 `*.plot.png`。
 - 暴露第一层拟合控制工具：增删/更新 source，改 fit window，改吸收 mask，改 continuum anchors/masks，请求 refit。
 - 把第一层工具调用保存成 `fit_control_patch`。
+- 把 patch 变成确定性的 fitter overrides，执行 refit，并记录 deterministic gate 决策。
+- 多轮 loop 只传递状态和图像，不重新实现工具 schema 或 refit 逻辑。
 - 把 review packet 压缩成 `fit_review` prompt messages，用于第二层结构复核。
 - 定义 provider-agnostic 的 `LLMClient` 协议。
 - 提供离线 client 和 OpenAI-compatible client。

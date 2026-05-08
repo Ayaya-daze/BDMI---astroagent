@@ -10,9 +10,9 @@
 
 1. `README.md`：入口页，只保留当前状态、运行方式和目录分层。
 2. `docs/minimal_implementation.md`：解释当前最小实现为什么这么切。
-3. `src/astroagent/review_packet.py`：审查包编排入口。
-4. `src/astroagent/review_continuum.py` / `review_plot.py` / `voigt_fit.py`：连续谱、画图、第一层拟合。
-5. `src/astroagent/llm_interface.py`：两层 LLM 接口骨架；第一层 `fit_control` 能看图并输出拟合工具调用，第二层 `fit_review` 做结构复核。
+3. `src/astroagent/review/packet.py`：审查包编排入口。
+4. `src/astroagent/review/continuum.py` / `src/astroagent/review/plot.py` / `src/astroagent/spectra/voigt_fit.py`：连续谱、画图、第一层拟合。
+5. `src/astroagent/agent/llm.py`：两层 LLM 接口骨架；第一层 `fit_control` 能看图并输出拟合工具调用，第二层 `fit_review` 做结构复核。
 6. `docs/llm_interface.md`：LLM 接口用法和边界。
 7. `tests/test_review_packet.py`：当前行为边界。
 8. `docs/project_plan.md`：研究路线，明确区分当前开发切片和未来规划。
@@ -24,19 +24,22 @@
 ```text
 configs/line_catalog.json
 scripts/make_review_packet.py
-src/astroagent/line_catalog.py
-src/astroagent/review_continuum.py
-src/astroagent/review_packet.py
-src/astroagent/review_plot.py
-src/astroagent/voigt_fit.py
-src/astroagent/llm_interface.py
-src/astroagent/fit_control_record.py
-src/astroagent/fit_control_apply.py
+src/astroagent/spectra/line_catalog.py
+src/astroagent/review/continuum.py
+src/astroagent/review/packet.py
+src/astroagent/review/plot.py
+src/astroagent/spectra/voigt_fit.py
+src/astroagent/agent/llm.py
+src/astroagent/agent/fit_control.py
+src/astroagent/agent/loop.py
+src/astroagent/agent/policy.py
 src/astroagent/cli/make_review_packet.py
 src/astroagent/cli/run_fit_review.py
 src/astroagent/cli/apply_fit_control_patch.py
+src/astroagent/cli/run_fit_control_loop.py
 tests/test_review_packet.py
 tests/test_llm_interface.py
+tests/test_fit_control_loop.py
 docs/minimal_implementation.md
 docs/llm_interface.md
 docs/project_plan.md

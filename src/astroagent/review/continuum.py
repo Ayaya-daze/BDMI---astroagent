@@ -110,6 +110,7 @@ def _local_anchor_continuum(
     anchor_weight: np.ndarray,
     smooth_nodes: bool = True,
 ) -> np.ndarray:
+    floor = _continuum_floor(anchor_flux)
     order = np.argsort(anchor_wave)
     x = anchor_wave[order]
     y = anchor_flux[order] if not smooth_nodes else _smooth_anchor_fluxes(anchor_flux[order], anchor_weight[order])
@@ -117,9 +118,9 @@ def _local_anchor_continuum(
     unique_x, unique_indices = np.unique(x, return_index=True)
     unique_y = y[unique_indices]
     if len(unique_x) == 0:
-        return np.full_like(wavelength, 1.0, dtype=float)
+        return np.full_like(wavelength, floor, dtype=float)
     if len(unique_x) == 1:
-        return np.full_like(wavelength, max(float(unique_y[0]), 1e-6), dtype=float)
+        return np.full_like(wavelength, max(float(unique_y[0]), floor), dtype=float)
     if len(unique_x) == 2:
         continuum = np.interp(wavelength, unique_x, unique_y)
     else:
@@ -132,7 +133,20 @@ def _local_anchor_continuum(
         if right.any():
             continuum[right] = np.interp(wavelength[right], unique_x[-2:], unique_y[-2:])
 
-    return np.clip(np.asarray(continuum, dtype=float), 1e-6, None)
+    return np.clip(np.asarray(continuum, dtype=float), floor, None)
+
+
+def _continuum_floor(values: np.ndarray | list[float]) -> float:
+    array = np.asarray(values, dtype=float)
+    finite_positive = array[np.isfinite(array) & (array > 0.0)]
+    if len(finite_positive):
+        scale = float(np.nanmedian(finite_positive))
+    else:
+        finite_abs = np.abs(array[np.isfinite(array)])
+        scale = float(np.nanmedian(finite_abs)) if len(finite_abs) else 1.0
+    if not np.isfinite(scale) or scale <= 0.0:
+        scale = 1.0
+    return float(max(scale * 1.0e-6, np.finfo(float).tiny))
 
 
 def _rolling_upper_envelope_continuum(
@@ -156,7 +170,8 @@ def _rolling_upper_envelope_continuum(
 
     wave_fit = wavelength[fit_mask]
     if len(wave_fit) == 0:
-        level = max(float(np.nanmedian(flux[good])) if good.any() else float(np.nanmedian(flux)), 1e-6)
+        floor = _continuum_floor(flux[good] if good.any() else flux)
+        level = max(float(np.nanmedian(flux[good])) if good.any() else float(np.nanmedian(flux)), floor)
         return np.full_like(flux, level), good.copy(), np.array([float(np.nanmedian(wavelength))]), {
             "anchor_strategy": "rolling_upper_envelope_fallback",
             "n_anchor_bins": 1,
@@ -219,12 +234,12 @@ def _rolling_upper_envelope_continuum(
             if not np.isfinite(anchor_A) or not np.isfinite(continuum_flux):
                 continue
             anchor_wave.append(anchor_A)
-            anchor_flux.append(max(continuum_flux, 1e-6))
+            anchor_flux.append(continuum_flux)
             anchor_weight.append(float(node.get("weight", 1.0)))
             manual_anchors.append(
                 {
                     "wavelength_A": anchor_A,
-                    "continuum_flux": max(continuum_flux, 1e-6),
+                    "continuum_flux": continuum_flux,
                     "source": str(node.get("source", "fit_control_node")),
                 }
             )
@@ -297,7 +312,8 @@ def _egent_like_continuum(
         fit_mask = good.copy()
 
     if good.sum() == 0:
-        continuum = np.full_like(flux, max(float(np.nanmedian(flux)), 1e-6), dtype=float)
+        floor = _continuum_floor(flux)
+        continuum = np.full_like(flux, max(float(np.nanmedian(flux)), floor), dtype=float)
         return continuum, good.copy(), {
             "fit_type": "egent_iterative_continuum",
             "method": "constant_fallback",
@@ -332,7 +348,7 @@ def _egent_like_continuum(
     if not np.isfinite(scatter) or scatter <= 0.0:
         scatter = 1.0
 
-    return np.clip(continuum, 1e-6, None), continuum_mask, {
+    return np.clip(continuum, _continuum_floor(continuum), None), continuum_mask, {
         "fit_type": "egent_iterative_continuum",
         "method": "rolling_upper_envelope_pchip",
         "polynomial_order": 0,
@@ -369,16 +385,48 @@ def build_plot_data(
         controls.get("continuum_mask_intervals_A", []),
     )
     continuum_exclusion_intervals = _contiguous_intervals(wavelength, continuum_exclusion_mask)
-    continuum, continuum_mask, summary = _egent_like_continuum(
-        wavelength,
-        flux,
-        good,
-        ivar=ivar,
-        exclude_mask=continuum_exclusion_mask,
-        extra_anchor_wavelengths_A=controls.get("continuum_anchor_wavelengths_A", []),
-        extra_anchor_nodes=controls.get("continuum_anchor_nodes", []),
-        remove_anchor_indices=controls.get("continuum_anchor_remove_indices", []),
-    )
+    provided_continuum = window["CONTINUUM"].to_numpy(dtype=float) if "CONTINUUM" in window.columns else None
+    if provided_continuum is not None and np.isfinite(provided_continuum).any():
+        continuum = np.asarray(provided_continuum, dtype=float)
+        continuum = np.where(np.isfinite(continuum) & (continuum > 0.0), continuum, np.nan)
+        if np.isfinite(continuum[good]).any():
+            baseline = float(np.nanmedian(continuum[good]))
+        elif np.isfinite(continuum).any():
+            baseline = float(np.nanmedian(continuum[np.isfinite(continuum)]))
+        else:
+            baseline = 1.0
+        if not np.isfinite(baseline) or baseline <= 0.0:
+            baseline = 1.0
+        fill_value = max(baseline * 1.0e-6, np.finfo(float).tiny)
+        continuum = np.where(np.isfinite(continuum) & (continuum > 0.0), continuum, fill_value)
+        continuum_mask = good & ~continuum_exclusion_mask
+        summary = {
+            "fit_type": "provided_continuum",
+            "method": "input_continuum_column",
+            "polynomial_order": 0,
+            "iterations": 0,
+            "top_percentile": None,
+            "sigma_clip": None,
+            "n_continuum_pixels": int(continuum_mask.sum()),
+            "coefficients_high_to_low": [float(np.nanmedian(continuum))],
+            "wave_center_A": float(np.nanmean(wavelength)),
+            "continuum_exclusion_kms": float(CONTINUUM_LINE_CORE_EXCLUSION_KMS if continuum_exclusion_mask is not None else 0.0),
+            "continuum_scatter": float(np.nanstd((flux[good] / continuum[good]) - 1.0)) if good.any() else 1.0,
+            "anchor_strategy": "provided_continuum_column",
+            "n_anchor_bins": 0,
+            "provided_continuum_column": True,
+        }
+    else:
+        continuum, continuum_mask, summary = _egent_like_continuum(
+            wavelength,
+            flux,
+            good,
+            ivar=ivar,
+            exclude_mask=continuum_exclusion_mask,
+            extra_anchor_wavelengths_A=controls.get("continuum_anchor_wavelengths_A", []),
+            extra_anchor_nodes=controls.get("continuum_anchor_nodes", []),
+            remove_anchor_indices=controls.get("continuum_anchor_remove_indices", []),
+        )
     normalized_flux = flux / continuum
     normalized_ivar = ivar * np.square(continuum)
 

@@ -4,8 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
-from astroagent.fit_control_record import build_fit_control_patch
-from astroagent.llm_interface import OfflineReviewClient, OpenAICompatibleClient, run_fit_control, run_fit_review
+from astroagent.agent.fit_control import build_fit_control_patch
+from astroagent.agent.llm import OfflineReviewClient, OpenAICompatibleClient, run_fit_control, run_fit_review
 
 
 def parse_args() -> argparse.Namespace:
