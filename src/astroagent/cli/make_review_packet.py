@@ -46,6 +46,9 @@ def main() -> None:
     paths = write_review_packet(record, window, args.output_dir)
     print(f"review json: {paths['json']}")
     print(f"window csv:  {paths['csv']}")
+    print(f"plot csv:    {paths['plot_csv']}")
+    print(f"model csv:   {paths['model_csv']}")
+    print(f"plot png:    {paths['plot_png']}")
     print(f"readme:      {paths['readme']}")
 
 

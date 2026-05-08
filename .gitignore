@@ -22,12 +22,13 @@ data/raw/**
 data/interim/**
 data/processed/**
 data/external/**
+data/cache/**
 outputs/**
 artifacts/**
 models/**
 runs/**
 wandb/**
-Egent/output/**
+Egent/
 
 # Keep directory placeholders
 !data/**/.gitkeep

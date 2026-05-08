@@ -42,6 +42,16 @@ def rest_wavelengths_A(line_id: str, catalog: dict[str, dict[str, Any]] | None =
     raise ValueError(f"line_id {line_id!r} has no rest wavelength field")
 
 
+def oscillator_strengths(line_id: str, catalog: dict[str, dict[str, Any]] | None = None) -> list[float]:
+    """Return oscillator strengths aligned with rest_wavelengths_A."""
+    definition = get_line_definition(line_id, catalog)
+    if "oscillator_strengths" in definition:
+        return [float(value) for value in definition["oscillator_strengths"]]
+    if "oscillator_strength" in definition:
+        return [float(definition["oscillator_strength"])]
+    return [1.0 for _ in rest_wavelengths_A(line_id, catalog)]
+
+
 def primary_rest_wavelength_A(
     line_id: str,
     catalog: dict[str, dict[str, Any]] | None = None,
@@ -51,3 +61,55 @@ def primary_rest_wavelength_A(
     if "primary_rest_wavelength_A" in definition:
         return float(definition["primary_rest_wavelength_A"])
     return rest_wavelengths_A(line_id, catalog)[0]
+
+
+def transition_definitions(
+    line_id: str,
+    catalog: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Expand a line-family id into individual spectral transitions.
+
+    A transition is one rest-frame spectral line.  Doublets and larger line
+    families therefore return multiple entries; each entry should get its own
+    local velocity frame downstream.
+    """
+    catalog_data = catalog if catalog is not None else load_line_catalog()
+    definition = get_line_definition(line_id, catalog_data)
+    transition_ids = definition.get("transition_line_ids")
+
+    if transition_ids:
+        transitions: list[dict[str, Any]] = []
+        for transition_line_id in transition_ids:
+            transition_definition = get_line_definition(str(transition_line_id), catalog_data)
+            transitions.append(
+                {
+                    "transition_line_id": str(transition_line_id),
+                    "family": transition_definition.get("family", definition.get("family", line_id)),
+                    "rest_wavelength_A": float(transition_definition["rest_wavelength_A"]),
+                    "oscillator_strength": float(transition_definition.get("oscillator_strength", 1.0)),
+                    "damping_gamma_kms": float(transition_definition.get("damping_gamma_kms", 0.001)),
+                    "atomic_label": transition_definition.get("atomic_label"),
+                    "role": transition_definition.get("role", "transition"),
+                }
+            )
+        return transitions
+
+    rests = rest_wavelengths_A(line_id, catalog_data)
+    strengths = oscillator_strengths(line_id, catalog_data)
+    if len(rests) == 1:
+        transition_ids = [line_id]
+    else:
+        transition_ids = [f"{line_id}_{index + 1}" for index in range(len(rests))]
+
+    return [
+        {
+            "transition_line_id": str(transition_line_id),
+            "family": definition.get("family", line_id),
+            "rest_wavelength_A": float(rest),
+            "oscillator_strength": float(strength),
+            "damping_gamma_kms": float(definition.get("damping_gamma_kms", 0.001)),
+            "atomic_label": definition.get("atomic_label"),
+            "role": definition.get("role", "transition"),
+        }
+        for transition_line_id, rest, strength in zip(transition_ids, rests, strengths, strict=True)
+    ]

@@ -1,238 +1,109 @@
 # Quasar 吸收谱后训练项目
 
-面向已知谱线假设的 quasar 吸收谱 LLM 后训练项目。
+这个仓库还在开发中。主线很短：给定 `line_id + z_sys` 和一段 quasar 光谱，工具层切出局域谱窗，先做连续谱和峰锚定，再在每条 `transition` 自己的局部 velocity frame 里拟合多个吸收峰，最后把结果交给 LLM/agent 做结构分析和人工审查。
 
-本项目不是直接复现 `Egent/`，也不是构建一个通用多模态光谱 agent。项目目标是借鉴 EGENT 的“传统光谱工具 + LLM 决策”路线，构造 quasar 吸收谱领域数据集，并通过 SFT 与规则奖励 RL 后训练，使开源 LLM 学会在已知 `line_id` 与系统红移 `z_sys` 的条件下完成局域谱窗判读、分析 mask 预测、连续谱锚点辅助标定，以及速度空间拟合结果复核。
+详细项目地图见 [docs/repo_map.md](docs/repo_map.md)。完整研究计划见 [docs/project_plan.md](docs/project_plan.md)。
 
-当前训练路线采用 **teacher-assisted post-training**：真实 DESI 谱窗提供数据分布，规则工具、GPT-5.4 teacher 与少量人工/QC 共同构造标签；最终学生模型通过 SFT 与规则/teacher 混合奖励 RL 学习固定 schema 下的窄域结构化决策。
+## 项目定位
 
-## 项目范围
+本项目不是重新写一套光谱物理工具。底层线表、速度换算、Voigt/profile 和多成分拟合优先复用 `srt` 里的 `astro` / `ABSpec` 成熟代码，本仓库只写薄 adapter、DESI 数据接入、审查包、LLM 接口和训练数据 schema。
 
-### 核心假设
+创新点在两层：
 
-输入中已经给定目标谱线身份与系统红移：
+- 第一层沿袭 EGENT 思路：传统工具先拟合；遇到连续谱不稳、成分数歧义、残差异常、blend 或多解时，可以申请大模型介入辅助拟合处理。
+- 第二层是本项目自己的大模型分析阶段：基于第一层输出分析吸收成分是否同源、谱线结构是否自洽、是否有 blend/污染、是否需要人工复核。
 
-- `line_id`
-- `z_sys`
-- quasar 光谱：`wavelength / flux / ivar / pipeline_mask`
+## 先看什么
 
-系统根据
+1. [docs/repo_map.md](docs/repo_map.md)：仓库导航，说明哪些文件是主线、哪些只是参考或产物。
+2. [docs/minimal_implementation.md](docs/minimal_implementation.md)：当前可运行的最小实现。
+3. [src/astroagent/review_packet.py](src/astroagent/review_packet.py)：审查包编排入口。
+4. [src/astroagent/review_continuum.py](src/astroagent/review_continuum.py)：连续谱与局域窗口处理。
+5. [src/astroagent/review_plot.py](src/astroagent/review_plot.py)：拟合模型和诊断图。
+6. [src/astroagent/llm_interface.py](src/astroagent/llm_interface.py)：LLM 接口骨架。
+7. [tests/test_review_packet.py](tests/test_review_packet.py)：当前行为边界。
 
-```text
-lambda_obs = lambda_rest * (1 + z_sys)
+## 当前阶段
+
+当前仍处于开发和重构阶段，不是定稿版本。现在可运行的是一个最小审查包切片，拟合链路正在按“第一层拟合、第二层分析”拆分。
+
+目前可用的开发切片有：
+
+- 谱线常量表：`configs/line_catalog.json`
+- 局域观测波长切窗
+- 速度坐标转换
+- 窗口质量摘要
+- line-family 元数据和审查字段；C IV / Mg II 只是第一批验证样例，不代表项目只做 doublet
+- 第一层拟合草案：每条 transition 自己建 velocity frame，拟合多个吸收峰
+- 第二层分析接口骨架：后续让 agent 判断同源关系、blend、结构和人工复核需求
+- Task A 的 rule baseline：analysis mask 和 continuum anchors
+- 人工裁决字段：保留最终科学判断给人
+- JSON/CSV 审查包输出
+- ABSpec 风格诊断图：每条 transition 一个速度空间子图，观测谱用 step，模型用平滑 Voigt component/combined 曲线
+- LLM 接口骨架：支持离线 client 和 OpenAI-compatible chat completions；完整多轮 agent loop 仍在开发中
+
+下一步主线还是接入 DESI 小批量真实数据，从 `TARGETID` 或 catalog 记录生成可审查的 review packets；实验输出不作为长期资产保留。
+
+## 运行
+
+从仓库根目录运行 demo：
+
+```bash
+.venv/bin/python scripts/make_review_packet.py
 ```
 
-自动切取目标谱线附近的局域谱窗。LLM 不负责从整条光谱中任意识别元素，也不直接替代物理拟合器，而是在工具层结果基础上做结构化分析决策。
+默认会生成一个合成样本用于本地检查。生成物只用于调试，不作为长期结果保留。
 
-重要约束：quasar 吸收线不是按固定规律必然出现。即使给定 `line_id` 和 `z_sys`，模型也必须判断局域谱窗中的吸收谷是否和候选吸收体自洽，例如 doublet 两条线是否同时支持、相对强度是否合理、是否可能只是噪声、sky residual、blend 或错误红移。
+使用自己的 CSV：
 
-更高层的科学解释必须保留人工裁决。例如吸收速度超过 halo virial 速度、不同元素的交叉验证不一致、多个红移系统都能解释同一凹陷时，agent 不直接给最终物理结论，而是输出所有候选测量、冲突 flags、证据摘要和推荐检查项，让人根据完整结果判断。
-
-### MVP 目标
-
-最小可交付版本优先聚焦 **C IV doublet**，原因是其双线物理约束较明确，适合构造可验证标签与规则奖励。DLA / H I、N V、O VI 可作为后续扩展。
-
-## 任务定义
-
-### Task A：局域 mask 与连续谱 anchor
-
-给定目标谱线的局域观测波长窗口，模型输出：
-
-- 是否需要扩展或缩小窗口
-- analysis mask 区间
-- continuum anchor points
-- 质量等级
-- 简短 rationale
-
-示例输出：
-
-```json
-{
-  "task": "local_mask_continuum",
-  "line_id": "CIV_1548",
-  "window_action": "keep",
-  "analysis_mask_intervals_A": [[5578.2, 5584.6], [5601.1, 5603.0]],
-  "continuum_anchor_points_A": [5568.0, 5572.5, 5594.0, 5608.0],
-  "quality": "medium",
-  "rationale": "Mask contaminated pixels and absorption cores before continuum fitting."
-}
+```bash
+.venv/bin/python scripts/make_review_packet.py \
+  --input-csv data/interim/example_spectrum.csv \
+  --line-id CIV_doublet \
+  --z-sys 2.6
 ```
 
-### Task B：速度空间拟合复核
+输入 CSV 至少需要四列：
 
-工具根据 Task A 输出完成局域 continuum fitting，并把归一化谱转换到目标线速度空间。传统拟合器生成候选拟合结果后，模型复核拟合质量并选择下一步动作。
+- `wavelength`
+- `flux`
+- `ivar`
+- `pipeline_mask`
 
-示例输出：
+运行第一层 LLM 拟合控制的最小接口：
 
-```json
-{
-  "task": "fit_review",
-  "line_id": "CIV_doublet",
-  "present": true,
-  "absorber_reasonable": true,
-  "consistency_status": "plausible",
-  "human_review_required": true,
-  "review_flags": ["cross_element_inconsistency"],
-  "candidate_results": [
-    {
-      "candidate_id": "fit_001",
-      "center_shift_kms": -38.0,
-      "n_components": 2,
-      "supported_by": ["CIV_1548", "CIV_1550"]
-    }
-  ],
-  "fit_ok": false,
-  "next_action": "add_component",
-  "preferred_n_components": 2,
-  "final_center_shift_kms": -38.0,
-  "quality": "medium",
-  "final_confidence": 0.78,
-  "rationale": "The residual is asymmetric near line center, suggesting an additional component."
-}
+```bash
+.venv/bin/python scripts/run_fit_review.py \
+  --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
+  --client offline \
+  --mode fit_control \
+  --plot-image outputs/review_packet/demo_CIV_doublet_z2p6000.plot.png
 ```
 
-## 数据计划
+`offline` client 不联网，只用于验证 schema 和文件链路。真实 provider 使用 `--client openai-compatible`，并通过 `ASTROAGENT_LLM_API_KEY`、`ASTROAGENT_LLM_MODEL`、`ASTROAGENT_LLM_BASE_URL` 配置。
+`fit_control` 模式会同时输出 `*.fit_control_patch.json`，供后续 refit loop 和 RL 使用。
 
-数据来源暂定为 DESI quasar spectra 及相关 DLA / absorption catalog。详细数据源边界见 [docs/data_sources.md](/Users/mac/Desktop/BDMI/astro/docs/data_sources.md)。
-
-本项目的 C IV 与 H I 路线都限定在 **quasar 光谱 / quasar sightline** 上。这里的 H I 默认指背景 quasar 光中的 Ly alpha / DLA 吸收系统，不混入普通恒星或星系光谱任务。
-
-样本构造策略：
-
-- 不假设 DESI 已经提供完整任务标签；真实谱窗负责提供真实数据分布
-- 从已知 C IV / DLA catalog 抽取正样本窗口
-- 从无目标吸收线区域抽取可验证负样本窗口
-- 加入 hard cases：低 SNR、sky residual、telluric contamination、gap、不连续采样、pipeline bad pixels、拟合失败、多成分吸收
-- 同一局域窗口可分别构造成 Task A 与 Task B 训练记录
-- 同一窗口可生成不同质量候选拟合结果，用于训练 `accept / refit / add_component / reject / inspect`
-- 使用规则标签、GPT-5.4 teacher 标签与 validator 过滤构造 silver labels
-- 保留约 100 到 150 条 hard/gold 样本，由人工/QC 确认，用于最终评测和误差分析
-
-目标规模：
-
-- 约 1000 个真实局域窗口
-- 每个窗口可生成 1 到 2 条训练记录
-- 数据划分：`train / valid / test = 70 / 15 / 15`
-
-## 训练计划
-
-### SFT
-
-使用 LLaMA-Factory 对 7B 或 8B 级开源模型进行监督微调。
-
-训练目标：
-
-- 遵守固定 JSON schema
-- 学会局域观测波长空间中的 mask 与 continuum anchor 输出
-- 学会读取速度空间拟合摘要并做结构化决策
-- 学会判断候选吸收峰是否和吸收体假设自洽
-- 遇到物理解释冲突时保留所有候选结果并触发人工审查
-- 输出保守、可验证、低幻觉的领域判断
-
-### RL
-
-使用 OpenRLHF 或 VeRL 进行规则奖励 RL。优先采用可程序化验证的 reward，不先训练 reward model。RL 奖励可加入 teacher agreement 项，但 teacher 不能覆盖物理 validator。
-
-Task A 奖励包括：
-
-- JSON 合法性
-- analysis mask 的 interval IoU 或 point-wise F1
-- anchor points 对 continuum 拟合误差的改善
-- window_action 正确性
-- rationale 与结构化输出一致性
-
-Task B 奖励包括：
-
-- JSON 合法性
-- `present` 判断正确
-- `fit_ok` 判断正确
-- `next_action` 判断正确
-- `preferred_n_components` 正确
-- `final_center_shift_kms` 容差命中
-- rationale 与结构化结论一致性
-
-## 评测计划
-
-必须比较：
-
-- Rule baseline
-- Base model
-- SFT model
-- SFT with GPT-5.4 teacher silver labels
-- SFT + RL model
-- SFT + RL with teacher-agreement reward
-
-主指标：
-
-- JSON 合法率
-- mask interval IoU / point-wise F1
-- continuum anchor 带来的拟合误差改善
-- `present` F1 / precision / recall
-- `fit_ok` accuracy
-- `next_action` accuracy
-- `preferred_n_components` accuracy
-- center shift MAE 或容差命中率
-
-对比实验：
-
-- 规则方法 baseline
-- 不带拟合结果摘要的 LLM 输入版本
-- 不带 `line_id` 的退化输入版本
-- 不带 `z_sys` 的退化输入版本
-
-这些对比用于验证 post-training 是否真正提升了局域谱线分析决策能力，以及模型是否利用了谱线先验与速度空间信息。
-
-## 与 EGENT 的关系
-
-`Egent/` 是参考文献 EGENT 的代码基线，不是本项目主体。
-
-本项目借鉴 EGENT 的部分思想：
-
-- 使用传统工具执行物理拟合
-- LLM 负责局域判读与拟合决策
-- 保留完整中间结果与可解释 provenance
-
-关键区别：
-
-- EGENT 面向恒星谱 equivalent width measurement
-- 本项目面向 quasar absorption spectra
-- EGENT 重点是 agent workflow
-- 本项目重点是 post-training：数据集构造、SFT、RL 与可验证评测
-- EGENT 当前没有显式 analysis mask 工具；本项目把 LLM 输出 mask 作为核心能力之一
-
-## 仓库结构
+## 目录分层
 
 ```text
 .
-├── BDMI 大作业.pdf          # 原始课程项目设想
-├── Egent/                  # EGENT 参考代码
-├── configs/                # 配置文件占位，后续放谱线表与训练配置
-├── data/                   # 数据目录占位，不提交真实大数据
-├── docs/
-│   ├── egent_reference.md  # EGENT 架构与最小复现说明
-│   └── project_plan.md     # 正式项目计划
-├── outputs/                # 实验输出占位，不提交生成结果
-├── scripts/                # 后续放数据构造与训练辅助脚本
-├── src/astroagent/         # 本项目 Python 包占位
-├── tests/                  # 后续放单元测试
-├── pyproject.toml          # Python 项目基础配置
-└── README.md               # 本项目入口文档
+├── src/astroagent/          # 本项目主线代码
+├── scripts/                 # 本地运行入口
+├── configs/                 # 谱线表和后续配置
+├── tests/                   # 最小行为测试
+├── docs/                    # 项目地图、计划、数据源和参考笔记
+├── data/                    # 数据占位，不提交大数据
+├── outputs/                 # 生成产物，不作为主线阅读入口
+├── Egent/                   # 外部参考代码，不是本项目主体
+└── BDMI 大作业.pdf          # 原始课程设想
 ```
 
-## 当前状态
+## 重要边界
 
-- 已明确项目边界：不做通用整谱 agent，不直接复现 EGENT
-- 已确定 MVP：优先 C IV doublet
-- 已拆分两个训练任务：Task A 与 Task B
-- 已确定训练路线：Rule labels / GPT-5.4 teacher -> SFT -> RL
-- 已确定评测路线：结构化指标 + ablation
-- 已加入最小人工审查包实现：谱线表、局域切窗、rule baseline、JSON/CSV 输出与单元测试
-- 已实测 EGENT 参考代码：direct fitting 正常，CherryIN `openai/gpt-5.4` 可跑通 LLM 视觉复核
-
-最小实现说明见 [docs/minimal_implementation.md](/Users/mac/Desktop/BDMI/astro/docs/minimal_implementation.md)。可以先运行：
-
-```bash
-python3 scripts/make_review_packet.py
-```
-
-下一步应接入 DESI 小批量 catalog，验证能否从 `TARGETID` 找回 quasar 光谱并生成真实 review packets。
+- `Egent/` 是参考实现，不是要直接维护的主线。
+- `srt` 里的 `astro` / `ABSpec` 是优先复用的成熟工具来源，主线代码只做 adapter 和流程编排。
+- 当前第一条验证任务用 C IV / Mg II 双线，但核心接口按通用 line-family / component / system 写。
+- LLM 不做整谱盲识别，也不替代物理拟合器。
+- LLM 接口现在只是一层薄 client，不绑定某一家 provider。
+- 更高层科学解释必须保留人工裁决。
+- 当前代码先保证中间产物可审查，再扩展到 DESI、teacher labels、SFT 和 RL。

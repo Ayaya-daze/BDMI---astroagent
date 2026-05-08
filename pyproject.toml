@@ -9,18 +9,28 @@ description = "Post-training utilities for local quasar absorption spectrum deci
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+  "matplotlib>=3.7",
   "numpy>=1.24",
   "pandas>=2.0",
   "scipy>=1.10",
 ]
 
-[project.scripts]
-astroagent-make-review-packet = "astroagent.cli.make_review_packet:main"
-
 [project.optional-dependencies]
+bayes = [
+  "ultranest>=4.5",
+]
+desi = [
+  "fitsio>=1.2",
+  "requests>=2.31",
+]
 dev = [
   "pytest>=7.0",
 ]
+
+[project.scripts]
+astroagent-make-review-packet = "astroagent.cli.make_review_packet:main"
+astroagent-run-fit-review = "astroagent.cli.run_fit_review:main"
+astroagent-apply-fit-control-patch = "astroagent.cli.apply_fit_control_patch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
