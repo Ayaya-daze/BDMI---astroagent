@@ -360,19 +360,19 @@ def _relabel_posterior_points_by_center_prior(
     return relabelled, True
 
 
-def _component_interval(summary: dict[str, Any], name: str, fallback: float) -> dict[str, float]:
+def _component_interval(summary: dict[str, Any], name: str) -> dict[str, float]:
     item = summary.get("posterior", {}).get(name, {})
     return {
-        "q16": float(item.get("q16", fallback)),
-        "median": float(item.get("median", fallback)),
-        "q84": float(item.get("q84", fallback)),
+        "q16": float(item.get("q16", np.nan)),
+        "median": float(item.get("median", np.nan)),
+        "q84": float(item.get("q84", np.nan)),
     }
 
 
 def _posterior_median_params(parameter_summary: dict[str, Any], fallback_params: np.ndarray) -> np.ndarray:
-    params = np.asarray(fallback_params, dtype=float).copy()
+    params = np.full_like(np.asarray(fallback_params, dtype=float), np.nan, dtype=float)
     if parameter_summary.get("backend") != "ultranest":
-        return np.full_like(params, np.nan, dtype=float)
+        return params
     posterior = parameter_summary.get("posterior", {})
     for index in range(len(params) // 3):
         for offset, field in enumerate(("logN", "b_kms", "center_velocity_kms")):
@@ -392,6 +392,7 @@ def _component_parameter_diagnostics(
     map_logN: float,
     map_b_kms: float,
     map_center_kms: float,
+    initializer_success: bool,
     parameter_summary: dict[str, Any],
     bounds_by_name: dict[str, tuple[float, float]],
 ) -> tuple[list[str], list[str], dict[str, Any]]:
@@ -412,9 +413,9 @@ def _component_parameter_diagnostics(
     mismatches: dict[str, dict[str, Any]] = {}
     at_bounds: list[str] = []
     for name, eval_value in eval_values.items():
-        map_value = float(map_values[name])
         median = float(posterior.get(name, {}).get("median", np.nan))
-        if np.isfinite(median):
+        if initializer_success and np.isfinite(median):
+            map_value = float(map_values[name])
             tolerance = 1.0
             if name.startswith("b_kms"):
                 tolerance = max(30.0, 0.35 * max(abs(float(map_value)), 1.0))
@@ -552,23 +553,13 @@ def _fit_peak_group_once(
 
     try:
         ls_result = least_squares(residual, p0_array, bounds=(lower_array, upper_array), max_nfev=5000)
+        map_params = np.asarray(ls_result.x, dtype=float)
+        initializer_success = bool(ls_result.success)
+        initializer_reason = "" if initializer_success else str(ls_result.message)
     except Exception as exc:
-        failed = [
-            {
-                **seed,
-                "_seed_order": index,
-                "fit_success": False,
-                "reason": f"simultaneous physical fit failed: {exc}",
-                "fit_pixel_mask_local": fit_mask,
-                "model_local": np.full(len(velocity), np.nan, dtype=float),
-            }
-            for index, seed in enumerate(seeds)
-        ]
-        return failed, np.full(len(velocity), np.nan, dtype=float), fit_mask
-
-    map_params = np.asarray(ls_result.x, dtype=float)
-    fit_success = bool(ls_result.success)
-    fit_reason = "" if ls_result.success else str(ls_result.message)
+        map_params = p0_array.copy()
+        initializer_success = False
+        initializer_reason = f"least-squares initializer failed: {exc}"
 
     nested_result = _run_ultranest_physical_posterior(
         vel_fit,
@@ -595,6 +586,8 @@ def _fit_peak_group_once(
         center_prior_mean=center_prior_mean_array,
         center_prior_sigma=center_prior_sigma_array,
     )
+    fit_success = parameter_summary.get("backend") == "ultranest"
+    fit_reason = "" if fit_success else initializer_reason
     params = _posterior_median_params(parameter_summary, map_params)
     if not np.all(np.isfinite(params)):
         failed = []
@@ -668,6 +661,7 @@ def _fit_peak_group_once(
             map_logN=map_logN,
             map_b_kms=map_b_kms,
             map_center_kms=map_center_kms,
+            initializer_success=initializer_success,
             parameter_summary=parameter_summary,
             bounds_by_name=bounds_by_name,
         )
@@ -780,9 +774,9 @@ def _fit_peak_group_once(
                 "damping_gamma_kms": float(damping_gamma_kms),
                 "tau_scale": column_density_to_tau_scale(logN, rest_wavelength_A, oscillator_strength),
                 "parameter_intervals": {
-                    "logN": _component_interval(parameter_summary, f"logN_{index}", logN),
-                    "b_kms": _component_interval(parameter_summary, f"b_kms_{index}", b_kms),
-                    "center_velocity_kms": _component_interval(parameter_summary, f"center_velocity_kms_{index}", center_kms),
+                    "logN": _component_interval(parameter_summary, f"logN_{index}"),
+                    "b_kms": _component_interval(parameter_summary, f"b_kms_{index}"),
+                    "center_velocity_kms": _component_interval(parameter_summary, f"center_velocity_kms_{index}"),
                 },
                 "chi2": chi2,
                 "reduced_chi2": reduced_chi2,

@@ -22,6 +22,8 @@ from astroagent.review.packet import (
     observed_wavelength_A,
     write_review_packet,
 )
+from astroagent.review import plot as review_plot
+from astroagent.spectra import voigt_fit
 
 
 class ReviewPacketTest(unittest.TestCase):
@@ -238,6 +240,200 @@ class ReviewPacketTest(unittest.TestCase):
             self.assertIn("parameter_intervals", component)
             self.assertIn("logN", component["parameter_intervals"])
             self.assertIn("center_prior", component)
+
+    def test_ultranest_posterior_success_overrides_initializer_failure(self):
+        class FailedInitializer:
+            success = False
+            message = "maximum function evaluations exceeded"
+
+            def __init__(self, x):
+                self.x = np.asarray(x, dtype=float)
+
+        def fake_least_squares(_residual, p0, bounds, max_nfev):
+            return FailedInitializer(p0)
+
+        def fake_posterior(*_args, **_kwargs):
+            return {
+                "paramnames": ["logN_0", "b_kms_0", "center_velocity_kms_0"],
+                "weighted_samples": {
+                    "points": np.asarray(
+                        [
+                            [13.0, 28.0, -2.0],
+                            [13.1, 30.0, 0.0],
+                            [13.2, 32.0, 2.0],
+                        ],
+                        dtype=float,
+                    ),
+                    "weights": np.asarray([1.0, 2.0, 1.0], dtype=float),
+                },
+                "posterior": {
+                    "mean": [13.1, 30.0, 0.0],
+                    "stdev": [0.1, 2.0, 2.0],
+                },
+                "logz": -12.0,
+                "logzerr": 0.1,
+                "ncall": 24,
+            }
+
+        old_least_squares = voigt_fit.least_squares
+        old_posterior = voigt_fit._run_ultranest_physical_posterior
+        voigt_fit.least_squares = fake_least_squares
+        voigt_fit._run_ultranest_physical_posterior = fake_posterior
+        try:
+            velocity = np.linspace(-120.0, 120.0, 49)
+            flux = 1.0 - 0.25 * np.exp(-0.5 * (velocity / 25.0) ** 2)
+            ivar = np.full_like(velocity, 900.0)
+            seeds = [{"seed_velocity_kms": 0.0, "depth_below_continuum": 0.25, "score": 1.0}]
+
+            fitted, model, fit_mask = voigt_fit._fit_peak_group_once(
+                velocity,
+                flux,
+                ivar,
+                np.ones_like(velocity, dtype=bool),
+                seeds,
+                local_fit_half_width_kms=180.0,
+                center_shift_limit_kms=120.0,
+                rest_wavelength_A=2796.352,
+                oscillator_strength=0.6123,
+                damping_gamma_kms=0.001,
+            )
+        finally:
+            voigt_fit.least_squares = old_least_squares
+            voigt_fit._run_ultranest_physical_posterior = old_posterior
+
+        self.assertTrue(fitted[0]["fit_success"])
+        self.assertEqual(fitted[0]["fit_backend"], "ultranest")
+        self.assertEqual(fitted[0]["parameter_estimator"], "posterior_median")
+        self.assertNotIn("component_parameter_posterior_degenerate", fitted[0].get("diagnostic_flags", []))
+        self.assertTrue(np.isfinite(model[fit_mask]).all())
+
+    def test_ultranest_posterior_still_runs_when_initializer_raises(self):
+        def raising_least_squares(_residual, _p0, _bounds, _max_nfev):
+            raise RuntimeError("initializer failed")
+
+        def fake_posterior(*_args, **_kwargs):
+            return {
+                "paramnames": ["logN_0", "b_kms_0", "center_velocity_kms_0"],
+                "weighted_samples": {
+                    "points": np.asarray(
+                        [
+                            [13.0, 28.0, -2.0],
+                            [13.1, 30.0, 0.0],
+                            [13.2, 32.0, 2.0],
+                        ],
+                        dtype=float,
+                    ),
+                    "weights": np.asarray([1.0, 2.0, 1.0], dtype=float),
+                },
+                "posterior": {"mean": [13.1, 30.0, 0.0], "stdev": [0.1, 2.0, 2.0]},
+                "logz": -12.0,
+                "logzerr": 0.1,
+                "ncall": 24,
+            }
+
+        old_least_squares = voigt_fit.least_squares
+        old_posterior = voigt_fit._run_ultranest_physical_posterior
+        voigt_fit.least_squares = raising_least_squares
+        voigt_fit._run_ultranest_physical_posterior = fake_posterior
+        try:
+            velocity = np.linspace(-120.0, 120.0, 49)
+            flux = 1.0 - 0.25 * np.exp(-0.5 * (velocity / 25.0) ** 2)
+            ivar = np.full_like(velocity, 900.0)
+            seeds = [{"seed_velocity_kms": 0.0, "depth_below_continuum": 0.25, "score": 1.0}]
+
+            fitted, model, fit_mask = voigt_fit._fit_peak_group_once(
+                velocity,
+                flux,
+                ivar,
+                np.ones_like(velocity, dtype=bool),
+                seeds,
+                local_fit_half_width_kms=180.0,
+                center_shift_limit_kms=120.0,
+                rest_wavelength_A=2796.352,
+                oscillator_strength=0.6123,
+                damping_gamma_kms=0.001,
+            )
+        finally:
+            voigt_fit.least_squares = old_least_squares
+            voigt_fit._run_ultranest_physical_posterior = old_posterior
+
+        self.assertTrue(fitted[0]["fit_success"])
+        self.assertEqual(fitted[0]["fit_backend"], "ultranest")
+        self.assertEqual(fitted[0]["parameter_estimator"], "posterior_median")
+        self.assertTrue(np.isfinite(model[fit_mask]).all())
+
+    def test_incomplete_posterior_does_not_fall_back_to_initializer_parameters(self):
+        def fake_posterior(*_args, **_kwargs):
+            return {
+                "paramnames": ["logN_0", "b_kms_0"],
+                "weighted_samples": {
+                    "points": np.asarray([[13.0, 28.0], [13.1, 30.0], [13.2, 32.0]], dtype=float),
+                    "weights": np.asarray([1.0, 2.0, 1.0], dtype=float),
+                },
+                "posterior": {"mean": [13.1, 30.0], "stdev": [0.1, 2.0]},
+                "logz": -12.0,
+                "logzerr": 0.1,
+                "ncall": 24,
+            }
+
+        old_posterior = voigt_fit._run_ultranest_physical_posterior
+        voigt_fit._run_ultranest_physical_posterior = fake_posterior
+        try:
+            velocity = np.linspace(-120.0, 120.0, 49)
+            flux = 1.0 - 0.25 * np.exp(-0.5 * (velocity / 25.0) ** 2)
+            ivar = np.full_like(velocity, 900.0)
+            seeds = [{"seed_velocity_kms": 0.0, "depth_below_continuum": 0.25, "score": 1.0}]
+
+            fitted, model, _fit_mask = voigt_fit._fit_peak_group_once(
+                velocity,
+                flux,
+                ivar,
+                np.ones_like(velocity, dtype=bool),
+                seeds,
+                local_fit_half_width_kms=180.0,
+                center_shift_limit_kms=120.0,
+                rest_wavelength_A=2796.352,
+                oscillator_strength=0.6123,
+                damping_gamma_kms=0.001,
+            )
+        finally:
+            voigt_fit._run_ultranest_physical_posterior = old_posterior
+
+        self.assertFalse(fitted[0]["fit_success"])
+        self.assertEqual(fitted[0]["parameter_estimator"], "none_posterior_unavailable")
+        self.assertIn("bayesian_posterior_unavailable", fitted[0]["diagnostic_flags"])
+        self.assertFalse(np.isfinite(model).any())
+
+    def test_component_interval_missing_posterior_values_are_not_filled_from_fit(self):
+        interval = voigt_fit._component_interval({"backend": "ultranest", "posterior": {}}, "logN_0")
+
+        self.assertTrue(np.isnan(interval["q16"]))
+        self.assertTrue(np.isnan(interval["median"]))
+        self.assertTrue(np.isnan(interval["q84"]))
+
+    def test_posterior_band_does_not_invent_uncertainty_for_degenerate_intervals(self):
+        component = {
+            "component_index": 0,
+            "fit_backend": "ultranest",
+            "parameter_estimator": "posterior_median",
+            "fit_success": True,
+            "transition_line_id": "MGII_2796",
+            "rest_wavelength_A": 2796.352,
+            "oscillator_strength": 0.6123,
+            "damping_gamma_kms": 0.001,
+            "parameter_intervals": {
+                "logN": {"q16": 13.0, "median": 13.0, "q84": 13.0},
+                "b_kms": {"q16": 30.0, "median": 30.0, "q84": 30.0},
+                "center_velocity_kms": {"q16": 0.0, "median": 0.0, "q84": 0.0},
+            },
+            "diagnostic_flags": [],
+        }
+        velocity = np.linspace(-80.0, 80.0, 21)
+
+        samples = review_plot._component_posterior_band(component, velocity, n_samples=8)
+
+        self.assertIsNotNone(samples)
+        self.assertTrue(np.allclose(samples, samples[0]))
 
     def test_doublet_velocity_frames_keep_independent_residual_samples(self):
         spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")

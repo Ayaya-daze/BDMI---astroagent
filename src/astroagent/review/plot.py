@@ -185,9 +185,11 @@ def _component_posterior_band(
     q16 = np.array([logN_i.get("q16"), b_i.get("q16"), center_i.get("q16")], dtype=float)
     q50 = np.array([logN_i.get("median"), b_i.get("median"), center_i.get("median")], dtype=float)
     q84 = np.array([logN_i.get("q84"), b_i.get("q84"), center_i.get("q84")], dtype=float)
-    if not np.all(np.isfinite(q50)):
+    if not np.all(np.isfinite(q16)) or not np.all(np.isfinite(q50)) or not np.all(np.isfinite(q84)):
         return None
-    scales = np.maximum((q84 - q16) / 2.0, np.array([0.12, 6.0, 12.0], dtype=float))
+    if np.any(q84 < q16):
+        return None
+    scales = (q84 - q16) / 2.0
     samples = []
     rng = np.random.default_rng(12345 + int(component.get("component_index", 0)))
     rest_A = float(component.get("rest_wavelength_A", np.nan))
@@ -196,10 +198,8 @@ def _component_posterior_band(
     if not np.isfinite(rest_A) or not np.isfinite(oscillator_strength) or not np.isfinite(damping_gamma_kms):
         return None
     for _ in range(int(n_samples)):
-        draw = rng.normal(q50, scales)
-        draw[0] = float(np.clip(draw[0], q16[0], q84[0] if np.isfinite(q84[0]) else draw[0]))
-        draw[1] = float(np.clip(draw[1], q16[1], q84[1] if np.isfinite(q84[1]) else draw[1]))
-        draw[2] = float(np.clip(draw[2], q16[2], q84[2] if np.isfinite(q84[2]) else draw[2]))
+        draw = np.where(scales > 0.0, rng.normal(q50, scales), q50)
+        draw = np.clip(draw, q16, q84)
         samples.append(
             physical_component_flux_model(
                 velocity_grid,
