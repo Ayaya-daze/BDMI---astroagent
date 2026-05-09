@@ -53,7 +53,7 @@
 从仓库根目录运行 demo：
 
 ```bash
-.venv/bin/python scripts/make_review_packet.py
+.venv/bin/python -m astroagent.cli.main packet
 ```
 
 默认会生成一个合成样本用于本地检查。生成物只用于调试，不作为长期结果保留。
@@ -61,7 +61,7 @@
 使用自己的 CSV：
 
 ```bash
-.venv/bin/python scripts/make_review_packet.py \
+.venv/bin/python -m astroagent.cli.main packet \
   --input-csv data/interim/example_spectrum.csv \
   --line-id CIV_doublet \
   --z-sys 2.6
@@ -77,15 +77,15 @@
 运行第一层 LLM 拟合控制的最小接口：
 
 ```bash
-.venv/bin/python scripts/run_fit_review.py \
+.venv/bin/python -m astroagent.cli.main llm \
   --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
   --client offline \
-  --mode fit_control \
-  --plot-image outputs/review_packet/demo_CIV_doublet_z2p6000.plot.png
+  --mode fit_control
 ```
 
 `offline` client 不联网，只用于验证 schema 和文件链路。真实 provider 使用 `--client openai-compatible`，并通过 `ASTROAGENT_LLM_API_KEY`、`ASTROAGENT_LLM_MODEL`、`ASTROAGENT_LLM_BASE_URL` 或 `ASTROAGENT_LLM_API_URL` 配置。
 `fit_control` 模式会同时输出 `*.fit_control_patch.json`，供后续 refit loop 和 RL 使用。
+如果同目录存在同名 `*.plot.png`，入口会自动作为图像输入；也可以用 `--plot-image` 显式指定。
 
 例如使用 Paratera GLM-4V 兼容接口时，可以在 shell 里临时设置：
 
@@ -98,15 +98,14 @@ export ASTROAGENT_LLM_BASE_URL='https://llmapi.paratera.com'
 运行有界 agent/tool/refit loop：
 
 ```bash
-.venv/bin/python scripts/run_fit_control_loop.py \
+.venv/bin/python -m astroagent.cli.main fit-loop \
   --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
-  --window-csv outputs/review_packet/demo_CIV_doublet_z2p6000.window.csv \
-  --plot-image outputs/review_packet/demo_CIV_doublet_z2p6000.plot.png \
   --client offline \
   --max-rounds 3
 ```
 
 loop 每轮复用同一套 `fit_control` tool schema、patch 记录和 deterministic refit gate。`offline` client 默认不发工具调用，只验证编排；真实多模态 provider 才会提出 add/update/remove source、mask/window/continuum edits，并触发下一轮 refit。
+如果同目录存在同名 `*.window.csv`、`*.overview.png` 和 `*.plot.png`，loop 入口会自动使用它们；也可以用参数显式覆盖。
 
 loop 不是单次 LLM 调用。每轮会把上一轮已经接受或保留的 overrides 作为下一轮输入，并同时给模型提供观测波长空间总览图和 velocity/residual 诊断图。模型可以一轮提出多个 source、window、mask 或 continuum edits；gate 只负责防止明显退化和记录人工复核状态，不负责最终科学裁决。
 

@@ -30,7 +30,7 @@
 从仓库根目录运行：
 
 ```bash
-.venv/bin/python scripts/make_review_packet.py
+.venv/bin/python -m astroagent.cli.main packet
 ```
 
 默认会生成一个合成的 C IV doublet quasar 吸收谱窗口。输出只用于开发检查，不作为长期结果保留。
@@ -53,7 +53,7 @@ outputs/review_packet/
 也可以传入自己的 CSV：
 
 ```bash
-.venv/bin/python scripts/make_review_packet.py \
+.venv/bin/python -m astroagent.cli.main packet \
   --input-csv data/interim/example_spectrum.csv \
   --line-id CIV_doublet \
   --z-sys 2.6

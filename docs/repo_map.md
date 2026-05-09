@@ -70,7 +70,7 @@ outputs/
 运行：
 
 ```bash
-.venv/bin/python scripts/make_review_packet.py
+.venv/bin/python -m astroagent.cli.main packet
 ```
 
 当前流程：
@@ -96,7 +96,7 @@ line catalog
 
 1. 用小批量 DESI 样本持续检查 review packet 和图像输出。
 2. 让第一层 agent 继续通过图像修正 source、window、mask 和 continuum anchors。
-3. 用 `astroagent-run-fit-review --mode fit_control` 读一个 review JSON 和 `*.plot.png`，输出 `*.llm_control.json` 与 `*.fit_control_patch.json`。
+3. 用 `astroagent llm --mode fit_control` 读一个 review JSON 和同名 `*.plot.png`，输出 `*.llm_control.json` 与 `*.fit_control_patch.json`。
 4. 让 `fit_control_patch + window.csv -> refit` 持续稳定，确保 refit 质量 gate 可靠。
 5. 增加第二层 agent 分析：判断同源关系、谱线结构、blend 和人工复核需求。
 6. 把人工/agent 修正后的 review packets 导出为 Task A-control / Task B 训练样本。

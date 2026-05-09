@@ -10,10 +10,10 @@ from astroagent.agent.loop import run_fit_control_loop
 from astroagent.agent.llm import OfflineReviewClient, OpenAICompatibleClient
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a bounded LLM fit-control tool loop over one review packet.")
     parser.add_argument("--review-json", type=Path, required=True, help="Initial *.review.json file.")
-    parser.add_argument("--window-csv", type=Path, required=True, help="Initial *.window.csv file.")
+    parser.add_argument("--window-csv", type=Path, default=None, help="Initial *.window.csv file. Defaults beside review JSON.")
     parser.add_argument("--plot-image", type=Path, default=None, help="Initial velocity-frame plot PNG. Defaults beside review JSON.")
     parser.add_argument("--overview-image", type=Path, default=None, help="Initial wavelength-space overview PNG. Defaults beside review JSON when present.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output directory. Defaults beside review JSON.")
@@ -26,13 +26,16 @@ def parse_args() -> argparse.Namespace:
         default="offline",
         help="'offline' is deterministic and does not call a network provider.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     record = json.loads(args.review_json.read_text(encoding="utf-8"))
-    window = pd.read_csv(args.window_csv)
+    window_csv = args.window_csv or _default_window_csv(args.review_json, record)
+    if window_csv is None:
+        raise SystemExit("could not infer --window-csv; pass it explicitly")
+    window = pd.read_csv(window_csv)
     output_dir = args.output_dir or args.review_json.parent
     image_paths = _initial_image_paths(args.review_json, record, overview_image=args.overview_image, plot_image=args.plot_image)
 
@@ -74,6 +77,14 @@ def _initial_image_paths(
     ]
     paths = [path for path in candidates if path.exists()]
     return paths or None
+
+
+def _default_window_csv(review_json: Path, record: dict[str, object]) -> Path | None:
+    sample_id = record.get("sample_id")
+    if not sample_id:
+        return None
+    candidate = review_json.parent / f"{sample_id}.window.csv"
+    return candidate if candidate.exists() else None
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from astroagent.review.packet import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a minimal human-review packet for one quasar absorption window."
     )
@@ -22,11 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--half-width-kms", type=float, default=1500.0, help="Window half width per line center.")
     parser.add_argument("--sample-id", default=None, help="Stable id for output filenames.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/review_packet"))
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     if args.input_csv is None:
         spectrum = make_demo_quasar_spectrum(z_sys=args.z_sys, line_id=args.line_id)
         source = {"kind": "synthetic_demo", "path": None}

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -333,6 +334,7 @@ class LLMInterfaceTest(unittest.TestCase):
                     str(paths["plot_png"]),
                 ],
                 cwd=ROOT,
+                env={**os.environ, "PYTHONPATH": str(SRC)},
                 check=True,
                 capture_output=True,
                 text=True,
@@ -345,6 +347,43 @@ class LLMInterfaceTest(unittest.TestCase):
             self.assertTrue(patch_path.exists())
             patch = json.loads(patch_path.read_text(encoding="utf-8"))
             self.assertEqual(patch["task"], "fit_control_patch")
+
+    def test_unified_cli_runs_llm_with_default_plot_image(self):
+        with tempfile.TemporaryDirectory(prefix="astroagent_unified_llm_cli_") as tmpdir:
+            outdir = Path(tmpdir)
+            spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
+            record, window = build_review_record(
+                spectrum=spectrum,
+                line_id="CIV_doublet",
+                z_sys=2.6,
+                sample_id="unified_cli_demo",
+                source={"kind": "unit_test"},
+            )
+            paths = write_review_packet(record, window, outdir)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "astroagent.cli.main",
+                    "llm",
+                    "--review-json",
+                    str(paths["json"]),
+                    "--client",
+                    "offline",
+                    "--mode",
+                    "fit_control",
+                ],
+                cwd=ROOT,
+                env={**os.environ, "PYTHONPATH": str(SRC)},
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertIn("unified_cli_demo.llm_control.json", result.stdout)
+            self.assertTrue((outdir / "unified_cli_demo.llm_control.json").exists())
+            self.assertTrue((outdir / "unified_cli_demo.fit_control_patch.json").exists())
 
     def test_fit_control_patch_can_be_applied_to_refit_record(self):
         spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
@@ -1366,6 +1405,70 @@ class LLMInterfaceTest(unittest.TestCase):
             self.assertGreaterEqual(refit["fit_control_application"]["summary"]["n_source_seeds"], 1)
             self.assertEqual(refit["fit_control_application"]["controls"]["source_detection_mode"], "controlled")
             self.assertIn("fit_control_evaluation", refit)
+
+    def test_unified_cli_apply_patch_infers_window_csv(self):
+        with tempfile.TemporaryDirectory(prefix="astroagent_unified_apply_cli_") as tmpdir:
+            outdir = Path(tmpdir)
+            spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
+            record, window = build_review_record(
+                spectrum=spectrum,
+                line_id="CIV_doublet",
+                z_sys=2.6,
+                sample_id="unified_apply_demo",
+                source={"kind": "unit_test"},
+            )
+            paths = write_review_packet(record, window, outdir)
+            transition_id = record["input"]["transitions"][0]["transition_line_id"]
+            patch_path = outdir / "unified_apply_demo.fit_control_patch.json"
+            patch_path.write_text(
+                json.dumps(
+                    {
+                        "task": "fit_control_patch",
+                        "source": "unit",
+                        "status": "tool_calls",
+                        "rationale": "add source",
+                        "tool_calls": [
+                            {
+                                "name": "add_absorption_source",
+                                "arguments": {
+                                    "transition_line_id": transition_id,
+                                    "center_velocity_kms": 130.0,
+                                    "reason": "test seed",
+                                },
+                            }
+                        ],
+                        "requires_refit": True,
+                        "applied": False,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "astroagent.cli.main",
+                    "apply-patch",
+                    "--review-json",
+                    str(paths["json"]),
+                    "--patch-json",
+                    str(patch_path),
+                    "--sample-id",
+                    "unified_apply_demo_refit",
+                    "--output-dir",
+                    str(outdir),
+                ],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            refit_json = outdir / "unified_apply_demo_refit.review.json"
+            self.assertIn(str(refit_json), result.stdout)
+            self.assertTrue(refit_json.exists())
 
     def test_agent_refit_does_not_auto_detect_new_sources_after_llm_seed(self):
         z_sys = 0.0

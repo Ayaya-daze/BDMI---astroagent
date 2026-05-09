@@ -28,6 +28,7 @@ dev = [
 ]
 
 [project.scripts]
+astroagent = "astroagent.cli.main:main"
 astroagent-make-review-packet = "astroagent.cli.make_review_packet:main"
 astroagent-run-fit-review = "astroagent.cli.run_fit_review:main"
 astroagent-apply-fit-control-patch = "astroagent.cli.apply_fit_control_patch:main"

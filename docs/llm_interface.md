@@ -88,17 +88,16 @@ export ASTROAGENT_LLM_BASE_URL=https://llmapi.paratera.com
 先生成 review packet：
 
 ```bash
-.venv/bin/python scripts/make_review_packet.py
+.venv/bin/python -m astroagent.cli.main packet
 ```
 
 再跑离线 LLM control：
 
 ```bash
-.venv/bin/python scripts/run_fit_review.py \
+.venv/bin/python -m astroagent.cli.main llm \
   --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
   --client offline \
-  --mode fit_control \
-  --plot-image outputs/review_packet/demo_CIV_doublet_z2p6000.plot.png
+  --mode fit_control
 ```
 
 输出文件默认是：
@@ -113,9 +112,8 @@ outputs/review_packet/demo_CIV_doublet_z2p6000.fit_control_patch.json
 把第一层 patch 应用回拟合器：
 
 ```bash
-.venv/bin/python scripts/apply_fit_control_patch.py \
+.venv/bin/python -m astroagent.cli.main apply-patch \
   --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
-  --window-csv outputs/review_packet/demo_CIV_doublet_z2p6000.window.csv \
   --patch-json outputs/review_packet/demo_CIV_doublet_z2p6000.fit_control_patch.json
 ```
 
@@ -124,13 +122,13 @@ outputs/review_packet/demo_CIV_doublet_z2p6000.fit_control_patch.json
 运行有界多轮 loop：
 
 ```bash
-.venv/bin/python scripts/run_fit_control_loop.py \
+.venv/bin/python -m astroagent.cli.main fit-loop \
   --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
-  --window-csv outputs/review_packet/demo_CIV_doublet_z2p6000.window.csv \
-  --plot-image outputs/review_packet/demo_CIV_doublet_z2p6000.plot.png \
   --client offline \
   --max-rounds 3
 ```
+
+这些统一入口会从 `sample_id` 自动推断同目录的 `*.window.csv`、`*.overview.png` 和 `*.plot.png`；旧的 `scripts/*.py` 包装入口仍然保留给未安装包的本地开发。
 
 `fit_control_loop` 的停止原因包括：
 
