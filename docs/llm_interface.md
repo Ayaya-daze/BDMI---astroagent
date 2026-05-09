@@ -29,6 +29,11 @@
   - source seed 现在可以显式携带 `center_prior_sigma_kms`、`center_prior_half_width_kms`、`logN`、`b_kms` 和上下界。
   - 重新生成 review JSON、plot CSV、model CSV 和 velocity-frame plot PNG。
   - 写入 `fit_control_evaluation`：比较原始拟合和 refit 后拟合，给出 `accepted`、`needs_human_review` 或内部兼容字段 `rejected`。这里的 `rejected` 表示 refit 不进入主状态、效果可能变差，不表示 LLM 介入没有价值。
+- `src/astroagent/spectra/voigt_fit.py`
+  - transition-frame Voigt 拟合的公开结果必须来自 UltraNest posterior median。
+  - least-squares / MAP 只允许作为 initializer 和诊断参考；不能填充 public model、residual、component 参数或 posterior interval。
+  - 如果 UltraNest posterior 不可用、不完整，或缺少任一组件参数 median，这个 transition fit 会标记为 posterior unavailable，并进入 review，而不是回退到 initializer。
+  - posterior band 只根据实际 q16/median/q84 绘制；不会人为加最小宽度来制造不确定性。
 - `src/astroagent/agent/loop.py`
   - 编排有界多轮 loop：`run_fit_control -> build_fit_control_patch -> refit_record_with_overrides -> write_review_packet`。
   - 不重新实现 provider、tool schema、patch normalization 或 refit gate，只保存每轮 `control_status`、tool 数、gate decision、是否推进到下一轮。
@@ -146,6 +151,8 @@ outputs/review_packet/demo_CIV_doublet_z2p6000.fit_control_patch.json
 - `logN_lower` / `logN_upper`
 - `b_kms`
 - `b_kms_lower` / `b_kms_upper`
+
+拟合参数来源有一个硬边界：MAP/least-squares 只用来初始化 posterior 或做诊断对照。`review.json`、`model.csv`、velocity 图、gate 指标和 prompt 摘要里的 component 参数都必须来自 posterior median；posterior 不完整时宁可失败并交给 review，也不使用 initializer 补值。
 
 refit 结果不是自动接受。检查 `*_refit.review.json` 里的 `fit_control_evaluation`：
 

@@ -88,8 +88,9 @@ outputs/review_packet/
 2. `scripts/apply_fit_control_patch.py` 读取原始 `*.review.json`、`*.window.csv` 和 patch。
 3. 工具层根据 patch 更新 continuum anchors/masks、fit windows、fit masks 和 source seeds。
 4. 确定性 fitter 重新生成 `*_refit.review.json`、`*_refit.plot.csv`、`*_refit.model.csv` 和 `*_refit.plot.png`。
-5. `fit_control_evaluation` 比较原始 fit 和 refit：失败、RMS 明显变差、组件数暴涨、fit pixel 被 mask 掉太多或 quality 退化时，patch 用内部兼容字段标记为 `rejected`，含义是不进入主状态、效果可能变差；仍有 high residual / inspect 信号时标记为 `needs_human_review`；只有无新增警告的改善才自动 `accepted`。
-6. `scripts/run_fit_control_loop.py` 在同一套 patch/refit/gate 上做多轮编排。每轮会继承上一轮已保留的 overrides，LLM 可以一次提出多个 source、window、mask 或 continuum edits。
+5. Voigt component 的公开参数、model、residual 和 interval 只接受 UltraNest posterior median / q16 / q84。least-squares/MAP 只作为 initializer 和诊断参考；posterior 不可用或不完整时不回退 initializer，而是标记需要 review。
+6. `fit_control_evaluation` 比较原始 fit 和 refit：失败、RMS 明显变差、组件数暴涨、fit pixel 被 mask 掉太多或 quality 退化时，patch 用内部兼容字段标记为 `rejected`，含义是不进入主状态、效果可能变差；仍有 high residual / inspect 信号时标记为 `needs_human_review`；只有无新增警告的改善才自动 `accepted`。
+7. `scripts/run_fit_control_loop.py` 在同一套 patch/refit/gate 上做多轮编排。每轮会继承上一轮已保留的 overrides，LLM 可以一次提出多个 source、window、mask 或 continuum edits。
 
 这还不是定稿拟合方案。它只用于验证第一层大模型能通过工具调用参与拟合输入修正，并为后续 RL 记录 action -> refit result。
 

@@ -83,6 +83,8 @@ line catalog
   -> absorber hypothesis check
   -> continuum / normalized spectrum
   -> transition-frame physical Voigt posterior summary
+     (public component parameters/model/residual come from posterior median;
+      least-squares/MAP is initializer-only and never a public fallback)
   -> Task A rule suggestion
   -> human review fields
   -> JSON/CSV review packet
