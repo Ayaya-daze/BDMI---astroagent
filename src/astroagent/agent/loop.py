@@ -88,6 +88,7 @@ def run_fit_control_loop(
     best_plot: list[Path] | None = None
     best_output_paths: dict[str, Path] | None = None
     best_score: tuple[float, float, int] | None = None
+    trial_controls = state.controls
 
     if not force and not _fit_control_needed(state.record):
         stop_reason = "not_needed_good_fit"
@@ -101,16 +102,26 @@ def run_fit_control_loop(
         )
 
     for round_index in range(1, int(max_rounds) + 1):
+        image_paths = state.image_paths
+        rejected_feedback = state.record.get("fit_control_last_rejected_refit")
+        if image_paths and isinstance(rejected_feedback, dict):
+            extra_images = [
+                value
+                for key in ("overview_png", "plot_png")
+                if (value := rejected_feedback.get(key))
+            ]
+            if extra_images:
+                image_paths = [*image_paths, *_image_paths(extra_images)]
         control = run_fit_control(
             state.record,
             client,
             temperature=temperature,
-            plot_image_path=state.image_paths,
+            plot_image_path=image_paths,
         )
         patch, round_overrides, candidate_controls, effective_patch = _prepare_round_controls(
             state.record,
             control,
-            state.controls,
+            trial_controls,
             round_index=round_index,
         )
         round_entry: dict[str, Any] = {
@@ -169,7 +180,16 @@ def run_fit_control_loop(
                 "sample_id": candidate.record.get("sample_id"),
                 "evaluation": evaluation,
                 "patch": patch,
+                "overview_png": str(candidate.output_paths.get("overview_png", "")),
+                "plot_png": str(candidate.output_paths.get("plot_png", "")),
             }
+            state.record["fit_control_last_refit_feedback"] = {
+                "sample_id": candidate.record.get("sample_id"),
+                "evaluation": evaluation,
+                "patch": patch,
+                "fit_summary": candidate.record.get("fit_results", [{}])[0],
+            }
+            trial_controls = candidate.controls
             if is_last_round:
                 stop_reason = "refit_rejected"
                 break
@@ -184,10 +204,17 @@ def run_fit_control_loop(
                 best_plot = candidate.image_paths
                 best_output_paths = candidate.output_paths
             state = _commit_candidate(candidate)
+            trial_controls = state.controls
             if is_last_round:
                 stop_reason = "needs_human_review"
                 break
             state.record["fit_control_loop"] = _loop_record(history, stop_reason=None)
+            state.record["fit_control_last_refit_feedback"] = {
+                "sample_id": candidate.record.get("sample_id"),
+                "evaluation": evaluation,
+                "patch": patch,
+                "fit_summary": candidate.record.get("fit_results", [{}])[0],
+            }
             continue
 
         round_entry["advanced"] = True
@@ -199,6 +226,13 @@ def run_fit_control_loop(
             best_plot = candidate.image_paths
             best_output_paths = candidate.output_paths
         state = _commit_candidate(candidate)
+        state.record["fit_control_last_refit_feedback"] = {
+            "sample_id": candidate.record.get("sample_id"),
+            "evaluation": evaluation,
+            "patch": patch,
+            "fit_summary": candidate.record.get("fit_results", [{}])[0],
+        }
+        trial_controls = state.controls
 
     else:
         stop_reason = "max_rounds_reached"
@@ -474,8 +508,15 @@ def _candidate_score(evaluation: dict[str, Any]) -> tuple[float, float, int]:
     work_window = refit.get("source_work_window", {}) if isinstance(refit.get("source_work_window", {}), dict) else {}
     work_rms = _score_float(work_window.get("fit_rms"), default=fit_rms)
     max_work_residual = _score_float(work_window.get("max_abs_residual_sigma"), default=0.0)
+    transition_frames = refit.get("transition_frames", {}) if isinstance(refit.get("transition_frames", {}), dict) else {}
+    max_frame_residual = 0.0
+    for frame in transition_frames.values():
+        if isinstance(frame, dict):
+            max_frame_residual = max(max_frame_residual, _score_float(frame.get("max_abs_residual_sigma"), default=0.0))
     fit_pixel_delta = _score_float(delta.get("n_fit_pixels"), default=0.0)
     fit_mask = delta.get("fit_mask", {}) if isinstance(delta.get("fit_mask", {}), dict) else {}
+    mask_boundary = delta.get("fit_mask_boundary_residual", {}) if isinstance(delta.get("fit_mask_boundary_residual", {}), dict) else {}
+    context_residual = delta.get("context_residual", {}) if isinstance(delta.get("context_residual", {}), dict) else {}
     core_mask_width = _score_float(fit_mask.get("core_width_kms"), default=0.0)
     boundary_mask_width = _score_float(fit_mask.get("boundary_width_kms"), default=0.0)
     context_mask_width = _score_float(fit_mask.get("context_width_kms"), default=0.0)
@@ -490,10 +531,16 @@ def _candidate_score(evaluation: dict[str, Any]) -> tuple[float, float, int]:
     broad_mask_penalty = max(0.0, max_mask_width - 70.0) * 0.12
     mask_count_penalty = max(0, n_mask_intervals - 6) * 1.0 + max(0, n_core_intervals - 1) * 3.0
     work_residual_penalty = max(0.0, max_work_residual - 12.0) * 0.20
+    frame_residual_penalty = max(0.0, max_frame_residual - 3.5) * 0.45
+    mask_boundary_penalty = max(0.0, _score_float(mask_boundary.get("max_abs_residual_sigma_near_mask"), default=0.0) - 3.0) * 0.60
+    context_residual_penalty = max(0.0, _score_float(context_residual.get("max_abs_residual_sigma_context"), default=0.0) - 3.0) * 0.75
     return (
         0.55 * fit_rms
         + 0.45 * work_rms
         + work_residual_penalty
+        + frame_residual_penalty
+        + mask_boundary_penalty
+        + context_residual_penalty
         + removed_pixel_penalty
         + mask_width_penalty
         + broad_mask_penalty

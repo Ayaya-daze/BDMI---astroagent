@@ -238,6 +238,60 @@ class FitControlLoopTest(unittest.TestCase):
         self.assertEqual(len(replaced), 1)
         self.assertEqual(replaced[0]["replace_component_index"], 0)
 
+    def test_trial_controls_can_carry_rejected_edits_into_next_round(self):
+        record, _ = self._demo_record_and_window()
+        transition_id = record["input"]["transitions"][0]["transition_line_id"]
+        first_control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "continuum trial",
+            "tool_calls": [
+                {
+                    "name": "update_continuum_mask",
+                    "arguments": {
+                        "start_wavelength_A": 5540.0,
+                        "end_wavelength_A": 5560.0,
+                        "mask_kind": "exclude",
+                        "reason": "trial continuum mask",
+                    },
+                }
+            ],
+        }
+        _, _, trial_controls, _ = _prepare_round_controls(
+            record,
+            first_control,
+            empty_fit_control_overrides(),
+            round_index=1,
+        )
+        second_control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "mask trial",
+            "tool_calls": [
+                {
+                    "name": "set_fit_mask_interval",
+                    "arguments": {
+                        "transition_line_id": transition_id,
+                        "start_velocity_kms": 500.0,
+                        "end_velocity_kms": 575.0,
+                        "mask_kind": "exclude",
+                        "reason": "trial edge mask",
+                    },
+                }
+            ],
+        }
+
+        _, _, candidate_controls, effective_patch = _prepare_round_controls(
+            record,
+            second_control,
+            trial_controls,
+            round_index=2,
+        )
+
+        self.assertEqual(len(candidate_controls["continuum_mask_intervals_A"]), 1)
+        self.assertEqual(len(candidate_controls["fit_mask_intervals"]), 1)
+        self.assertEqual([call["name"] for call in effective_patch["tool_calls"]], ["update_continuum_mask", "set_fit_mask_interval"])
+
     def test_candidate_score_penalizes_core_mask_more_than_context_mask(self):
         base = {
             "metrics": {

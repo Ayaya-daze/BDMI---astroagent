@@ -159,6 +159,7 @@ def _rolling_upper_envelope_continuum(
     extra_anchor_wavelengths_A: list[float] | None = None,
     extra_anchor_nodes: list[dict[str, Any]] | None = None,
     remove_anchor_indices: list[int] | None = None,
+    remove_anchor_wavelengths_A: list[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
     fit_mask = good.copy() if exclude_mask is None else good & ~exclude_mask
     if fit_mask.sum() < max(8, int(good.sum() * 0.30)):
@@ -255,6 +256,21 @@ def _rolling_upper_envelope_continuum(
         anchor_flux = [item[1] for item in kept]
         anchor_weight = [item[2] for item in kept]
 
+    removed_anchor_wavelengths: list[float] = []
+    if remove_anchor_wavelengths_A:
+        targets = [float(value) for value in remove_anchor_wavelengths_A if np.isfinite(float(value))]
+        for target in targets:
+            if not anchor_wave:
+                break
+            distances = np.abs(np.asarray(anchor_wave, dtype=float) - target)
+            nearest = int(np.argmin(distances))
+            tolerance_A = max(0.5, 0.25 * float(np.nanmedian(np.diff(np.sort(wavelength)))) if len(wavelength) > 1 else 0.5)
+            if float(distances[nearest]) <= tolerance_A:
+                removed_anchor_wavelengths.append(float(anchor_wave[nearest]))
+                del anchor_wave[nearest]
+                del anchor_flux[nearest]
+                del anchor_weight[nearest]
+
     anchors_w = np.asarray(anchor_wave, dtype=float)
     anchors_f = np.asarray(anchor_flux, dtype=float)
     anchors_weight = np.asarray(anchor_weight, dtype=float)
@@ -288,6 +304,7 @@ def _rolling_upper_envelope_continuum(
         "manual_anchor_nodes": manual_anchors,
         "manual_anchor_wavelengths_A": [float(node["wavelength_A"]) for node in manual_anchors],
         "removed_anchor_indices": [int(index) for index in remove_anchor_indices or []],
+        "removed_anchor_wavelengths_A": removed_anchor_wavelengths,
     }
 
 
@@ -302,6 +319,7 @@ def _egent_like_continuum(
     extra_anchor_wavelengths_A: list[float] | None = None,
     extra_anchor_nodes: list[dict[str, Any]] | None = None,
     remove_anchor_indices: list[int] | None = None,
+    remove_anchor_wavelengths_A: list[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     if exclude_mask is None:
         fit_mask = good.copy()
@@ -334,6 +352,7 @@ def _egent_like_continuum(
         extra_anchor_wavelengths_A=extra_anchor_wavelengths_A,
         extra_anchor_nodes=extra_anchor_nodes,
         remove_anchor_indices=remove_anchor_indices,
+        remove_anchor_wavelengths_A=remove_anchor_wavelengths_A,
     )
 
     residuals = flux - continuum
@@ -426,6 +445,7 @@ def build_plot_data(
             extra_anchor_wavelengths_A=controls.get("continuum_anchor_wavelengths_A", []),
             extra_anchor_nodes=controls.get("continuum_anchor_nodes", []),
             remove_anchor_indices=controls.get("continuum_anchor_remove_indices", []),
+            remove_anchor_wavelengths_A=controls.get("continuum_anchor_remove_wavelengths_A", []),
         )
     normalized_flux = flux / continuum
     normalized_ivar = ivar * np.square(continuum)

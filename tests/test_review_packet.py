@@ -52,6 +52,10 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertEqual(record["fit_results"][0]["fit_method"], "ultranest_physical_transition_frame")
         self.assertEqual(record["fit_results"][0]["n_transition_frames"], 2)
         self.assertEqual(record["fit_results"][0]["source_work_window_kms"], [-400.0, 400.0])
+        self.assertIn("chi2", record["fit_results"][0])
+        self.assertIn("reduced_chi2", record["fit_results"][0])
+        self.assertIn("chi2", record["fit_results"][0]["source_work_window_metrics"])
+        self.assertIn("reduced_chi2", record["fit_results"][0]["source_work_window_metrics"])
         self.assertIn("fit_rms", record["fit_results"][0]["source_work_window_metrics"])
         self.assertIn("transition_frames", record["fit_results"][0])
         components = record["fit_results"][0]["components"]
@@ -235,6 +239,31 @@ class ReviewPacketTest(unittest.TestCase):
             self.assertIn("logN", component["parameter_intervals"])
             self.assertIn("center_prior", component)
 
+    def test_doublet_velocity_frames_keep_independent_residual_samples(self):
+        spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="CIV_doublet",
+            z_sys=2.6,
+            sample_id="frame_residual_demo",
+            source={"kind": "unit_test"},
+        )
+        _, _, fit_summary = build_plot_and_fit_data(window, record["input"])
+
+        frames = fit_summary["transition_frames"]
+        self.assertEqual(len(frames), 2)
+        residual_counts = [len(frame.get("residual_samples", [])) for frame in frames]
+        self.assertTrue(all(count > 0 for count in residual_counts))
+        self.assertEqual(fit_summary["n_fit_pixels"], sum(residual_counts))
+        self.assertAlmostEqual(fit_summary["reduced_chi2"], fit_summary["fit_rms"] ** 2)
+        self.assertAlmostEqual(fit_summary["chi2"], fit_summary["reduced_chi2"] * fit_summary["n_fit_pixels"])
+        for frame in frames:
+            samples = frame["residual_samples"]
+            velocities = [sample["velocity_kms"] for sample in samples]
+            self.assertGreaterEqual(min(velocities), -fit_summary["transition_half_width_kms"])
+            self.assertLessEqual(max(velocities), fit_summary["transition_half_width_kms"])
+            self.assertTrue(all("residual_sigma" in sample for sample in samples))
+
     def test_voigt_fit_handles_multiple_peaks_in_one_transition_frame_simultaneously(self):
         z_sys = 0.0
         rest_A = 2796.352
@@ -313,6 +342,66 @@ class ReviewPacketTest(unittest.TestCase):
         )
         self.assertEqual(len(centers), 1)
 
+    def test_voigt_fit_flags_saturated_redundant_explicit_sources(self):
+        z_sys = 0.0
+        rest_A = 2796.352
+        wavelength = np.arange(rest_A - 4.0, rest_A + 4.0, 0.08)
+        velocity = (wavelength / rest_A - 1.0) * 299792.458
+        flux = 1.0 - 0.96 * np.exp(-0.5 * (velocity / 55.0) ** 2)
+        spectrum = pd.DataFrame(
+            {
+                "wavelength": wavelength,
+                "flux": np.clip(flux, 0.01, None),
+                "ivar": np.full_like(wavelength, 900.0),
+                "pipeline_mask": np.zeros_like(wavelength, dtype=int),
+            }
+        )
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="MGII_2796",
+            z_sys=z_sys,
+            sample_id="saturated_redundant_sources",
+            source={"kind": "unit_test"},
+            half_width_kms=420.0,
+        )
+        fit_control = {
+            "source_detection_mode": "controlled",
+            "source_seeds": [
+                {
+                    "transition_line_id": "MGII_2796",
+                    "center_velocity_kms": -60.0,
+                    "explicit_fit_control_source": True,
+                    "depth_below_continuum": 0.85,
+                    "b_kms": 70.0,
+                    "center_prior_half_width_kms": 40.0,
+                    "logN_lower": 15.0,
+                    "logN_upper": 18.8,
+                },
+                {
+                    "transition_line_id": "MGII_2796",
+                    "center_velocity_kms": 60.0,
+                    "explicit_fit_control_source": True,
+                    "depth_below_continuum": 0.85,
+                    "b_kms": 70.0,
+                    "center_prior_half_width_kms": 40.0,
+                    "logN_lower": 15.0,
+                    "logN_upper": 18.8,
+                },
+            ],
+            "fit_mask_intervals": [],
+            "fit_windows": {},
+            "removed_sources": [],
+        }
+        _, _, fit_summary = build_plot_and_fit_data(window, record["input"], fit_control=fit_control)
+
+        flags = [
+            flag
+            for component in fit_summary["components"]
+            for flag in component.get("diagnostic_flags", [])
+        ]
+        self.assertIn("saturated_redundant_component", flags)
+        self.assertIn("saturated_redundant_component", fit_summary["agent_review"]["reasons"])
+
     def test_voigt_fit_infers_nonzero_absorber_velocity(self):
         z_catalog = 2.6
         z_abs = 2.6015
@@ -338,7 +427,7 @@ class ReviewPacketTest(unittest.TestCase):
         ]
         self.assertTrue(any(abs(velocity - expected_velocity) < 80.0 for velocity in peak_velocities))
 
-    def test_voigt_fit_keeps_far_absorption_inside_transition_frame_without_soft_prior(self):
+    def test_voigt_fit_keeps_far_absorption_as_context_diagnostic_not_source_fit(self):
         z_catalog = 2.6
         z_far = 2.6066
         spectrum = make_demo_quasar_spectrum(z_sys=z_far, line_id="CIV_doublet")
@@ -360,7 +449,16 @@ class ReviewPacketTest(unittest.TestCase):
             for peak in frame.get("peaks", [])
             if peak.get("fit_success")
         ]
-        self.assertTrue(any(abs(velocity) > 500.0 for velocity in peak_velocities))
+        self.assertTrue(all(abs(velocity) <= 400.0 for velocity in peak_velocities))
+        diagnostic_context_residuals = [
+            sample
+            for frame in fit_summary["transition_frames"]
+            for sample in frame.get("diagnostic_residual_samples", [])
+            if abs(float(sample.get("velocity_kms", 0.0))) > 500.0
+            and abs(float(sample.get("residual_sigma", 0.0))) > 3.0
+            and sample.get("used_in_fit") is False
+        ]
+        self.assertTrue(diagnostic_context_residuals)
         self.assertTrue(fit_summary["agent_review"]["required"])
         self.assertIn("no_absorption_peak_detected_in_transition_frame", fit_summary["agent_review"]["reasons"])
 

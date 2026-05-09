@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from scipy.integrate import trapezoid
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, linear_sum_assignment
 
 from astroagent.agent.policy import SOURCE_WORK_WINDOW_KMS
 from astroagent.spectra.line_catalog import load_line_catalog, transition_definitions
@@ -75,6 +75,30 @@ def _fit_peak_group(
 ) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
     if not seeds:
         return [], np.full(len(velocity), np.nan, dtype=float), np.zeros(len(velocity), dtype=bool)
+
+    seed_duplicates: set[int] = set()
+    close_seed_merge_separation_kms = min(15.0, 0.25 * merge_separation_kms)
+    for i in range(len(seeds)):
+        for j in range(i + 1, len(seeds)):
+            try:
+                center_i = float(seeds[i].get("seed_velocity_kms", seeds[i].get("center_velocity_kms")))
+                center_j = float(seeds[j].get("seed_velocity_kms", seeds[j].get("center_velocity_kms")))
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(center_i) or not np.isfinite(center_j):
+                continue
+            same_explicit_status = bool(seeds[i].get("explicit_fit_control_source")) == bool(seeds[j].get("explicit_fit_control_source"))
+            if abs(center_i - center_j) < close_seed_merge_separation_kms:
+                score_i = float(seeds[i].get("score", 0.0))
+                score_j = float(seeds[j].get("score", 0.0))
+                explicit_i = bool(seeds[i].get("explicit_fit_control_source"))
+                explicit_j = bool(seeds[j].get("explicit_fit_control_source"))
+                if explicit_i != explicit_j:
+                    seed_duplicates.add(j if explicit_i else i)
+                elif same_explicit_status:
+                    seed_duplicates.add(j if score_i >= score_j else i)
+    if seed_duplicates and len(seeds) - len(seed_duplicates) >= 1:
+        seeds = [seed for index, seed in enumerate(seeds) if index not in seed_duplicates]
 
     fit_mask = good.copy()
     min_fit_pixels = max(8, 3 * len(seeds) + 3)
@@ -235,6 +259,8 @@ def _parameter_summary_from_posterior(
     nested_result: dict[str, Any] | None,
     *,
     bounds: dict[str, tuple[float, float]],
+    center_prior_mean: np.ndarray | None = None,
+    center_prior_sigma: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if nested_result is None:
         return {"backend": "least_squares", "posterior": {}}
@@ -242,11 +268,17 @@ def _parameter_summary_from_posterior(
     param_names = [str(name) for name in nested_result.get("paramnames", [])]
     points = np.asarray(nested_result.get("weighted_samples", {}).get("points", []), dtype=float)
     weights = np.asarray(nested_result.get("weighted_samples", {}).get("weights", []), dtype=float)
+    points, relabelled = _relabel_posterior_points_by_center_prior(points, center_prior_mean)
+    center_prior_mean = None if center_prior_mean is None else np.asarray(center_prior_mean, dtype=float)
+    center_prior_sigma = None if center_prior_sigma is None else np.asarray(center_prior_sigma, dtype=float)
     posterior = nested_result.get("posterior", {})
     posterior_map: dict[str, Any] = {}
     for i, name in enumerate(param_names):
         if points.ndim == 2 and points.shape[0] and points.shape[1] > i and len(weights) == points.shape[0]:
-            q16, q50, q84 = _weighted_quantile(points[:, i], weights, [0.16, 0.50, 0.84])
+            sample_mask = _component_center_condition_mask(name, points, center_prior_mean, center_prior_sigma)
+            sample_points = points[sample_mask, i] if sample_mask is not None else points[:, i]
+            sample_weights = weights[sample_mask] if sample_mask is not None else weights
+            q16, q50, q84 = _weighted_quantile(sample_points, sample_weights, [0.16, 0.50, 0.84])
         else:
             median = posterior.get("median", [np.nan] * len(param_names))[i]
             errlo = posterior.get("errlo", [np.nan] * len(param_names))[i]
@@ -265,9 +297,67 @@ def _parameter_summary_from_posterior(
         "logz": float(nested_result.get("logz", np.nan)),
         "logzerr": float(nested_result.get("logzerr", np.nan)),
         "ncall": int(nested_result.get("ncall", 0) or 0),
+        "posterior_component_labels": "center_prior_order" if relabelled else "sampler_order",
         "maximum_likelihood": nested_result.get("maximum_likelihood", {}),
         "posterior": posterior_map,
     }
+
+
+def _component_center_condition_mask(
+    name: str,
+    points: np.ndarray,
+    center_prior_mean: np.ndarray | None,
+    center_prior_sigma: np.ndarray | None,
+) -> np.ndarray | None:
+    if center_prior_mean is None or center_prior_sigma is None or "_" not in name:
+        return None
+    try:
+        component_index = int(str(name).rsplit("_", 1)[1])
+    except ValueError:
+        return None
+    if component_index < 0 or component_index >= len(center_prior_mean) or component_index >= len(center_prior_sigma):
+        return None
+    center_column = component_index * 3 + 2
+    if points.ndim != 2 or points.shape[1] <= center_column:
+        return None
+    mean = float(center_prior_mean[component_index])
+    sigma = float(center_prior_sigma[component_index])
+    if not np.isfinite(mean) or not np.isfinite(sigma):
+        return None
+    half_width = max(20.0, sigma)
+    mask = np.isfinite(points[:, center_column]) & (np.abs(points[:, center_column] - mean) <= half_width)
+    if int(mask.sum()) < max(16, int(0.05 * points.shape[0])):
+        return None
+    return mask
+
+
+def _relabel_posterior_points_by_center_prior(
+    points: np.ndarray,
+    center_prior_mean: np.ndarray | None,
+) -> tuple[np.ndarray, bool]:
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or not points.shape[0] or points.shape[1] < 6:
+        return points, False
+    if center_prior_mean is None:
+        return points, False
+    center_prior_mean = np.asarray(center_prior_mean, dtype=float)
+    n_components = points.shape[1] // 3
+    if n_components < 2 or len(center_prior_mean) != n_components or np.any(~np.isfinite(center_prior_mean)):
+        return points, False
+
+    relabelled = np.full_like(points, np.nan, dtype=float)
+    for row_index, row in enumerate(points):
+        centers = row[2::3]
+        if len(centers) != n_components or np.any(~np.isfinite(centers)):
+            relabelled[row_index] = row
+            continue
+        cost = np.abs(centers[:, None] - center_prior_mean[None, :])
+        source_indices, target_indices = linear_sum_assignment(cost)
+        reordered = np.empty_like(row, dtype=float)
+        for source_index, target_index in zip(source_indices, target_indices, strict=True):
+            reordered[target_index * 3 : target_index * 3 + 3] = row[source_index * 3 : source_index * 3 + 3]
+        relabelled[row_index] = reordered
+    return relabelled, True
 
 
 def _component_interval(summary: dict[str, Any], name: str, fallback: float) -> dict[str, float]:
@@ -277,6 +367,80 @@ def _component_interval(summary: dict[str, Any], name: str, fallback: float) -> 
         "median": float(item.get("median", fallback)),
         "q84": float(item.get("q84", fallback)),
     }
+
+
+def _posterior_median_params(parameter_summary: dict[str, Any], fallback_params: np.ndarray) -> np.ndarray:
+    params = np.asarray(fallback_params, dtype=float).copy()
+    if parameter_summary.get("backend") != "ultranest":
+        return np.full_like(params, np.nan, dtype=float)
+    posterior = parameter_summary.get("posterior", {})
+    for index in range(len(params) // 3):
+        for offset, field in enumerate(("logN", "b_kms", "center_velocity_kms")):
+            item = posterior.get(f"{field}_{index}", {})
+            median = float(item.get("median", np.nan))
+            if np.isfinite(median):
+                params[index * 3 + offset] = median
+    return params
+
+
+def _component_parameter_diagnostics(
+    *,
+    index: int,
+    eval_logN: float,
+    eval_b_kms: float,
+    eval_center_kms: float,
+    map_logN: float,
+    map_b_kms: float,
+    map_center_kms: float,
+    parameter_summary: dict[str, Any],
+    bounds_by_name: dict[str, tuple[float, float]],
+) -> tuple[list[str], list[str], dict[str, Any]]:
+    flags: list[str] = []
+    warnings: list[str] = []
+    details: dict[str, Any] = {}
+    posterior = parameter_summary.get("posterior", {})
+    eval_values = {
+        f"logN_{index}": eval_logN,
+        f"b_kms_{index}": eval_b_kms,
+        f"center_velocity_kms_{index}": eval_center_kms,
+    }
+    map_values = {
+        f"logN_{index}": map_logN,
+        f"b_kms_{index}": map_b_kms,
+        f"center_velocity_kms_{index}": map_center_kms,
+    }
+    mismatches: dict[str, dict[str, Any]] = {}
+    at_bounds: list[str] = []
+    for name, eval_value in eval_values.items():
+        map_value = float(map_values[name])
+        median = float(posterior.get(name, {}).get("median", np.nan))
+        if np.isfinite(median):
+            tolerance = 1.0
+            if name.startswith("b_kms"):
+                tolerance = max(30.0, 0.35 * max(abs(float(map_value)), 1.0))
+            elif name.startswith("center_velocity"):
+                tolerance = 45.0
+            if abs(float(map_value) - median) > tolerance:
+                mismatches[name] = {
+                    "posterior_median": median,
+                    "initializer_offset_exceeds_tolerance": True,
+                }
+        bounds = bounds_by_name.get(name)
+        if bounds is None:
+            continue
+        lower, upper = float(bounds[0]), float(bounds[1])
+        span = max(upper - lower, 1e-12)
+        if abs(float(eval_value) - lower) <= 0.01 * span or abs(float(eval_value) - upper) <= 0.01 * span:
+            at_bounds.append(name)
+    if mismatches:
+        flags.append("component_parameter_posterior_degenerate")
+        warnings.append("component posterior is degenerate relative to the initialization; saturated/blended fit is weakly constrained")
+        details["posterior_initializer_degeneracy"] = mismatches
+    if at_bounds:
+        flags.append("component_at_parameter_bound")
+        warnings.append("component parameter is pinned near a fit bound")
+        details["parameters_at_bounds"] = at_bounds
+    return flags, warnings, details
 
 
 def _guess_b_kms(seed: dict[str, Any]) -> float:
@@ -402,7 +566,7 @@ def _fit_peak_group_once(
         ]
         return failed, np.full(len(velocity), np.nan, dtype=float), fit_mask
 
-    params = np.asarray(ls_result.x, dtype=float)
+    map_params = np.asarray(ls_result.x, dtype=float)
     fit_success = bool(ls_result.success)
     fit_reason = "" if ls_result.success else str(ls_result.message)
 
@@ -425,6 +589,36 @@ def _fit_peak_group_once(
         fit_backend = "least_squares"
         fit_method = "least_squares_physical_transition_frame"
 
+    parameter_summary = _parameter_summary_from_posterior(
+        nested_result,
+        bounds=bounds_by_name,
+        center_prior_mean=center_prior_mean_array,
+        center_prior_sigma=center_prior_sigma_array,
+    )
+    params = _posterior_median_params(parameter_summary, map_params)
+    if not np.all(np.isfinite(params)):
+        failed = []
+        for index, seed in enumerate(seeds):
+            offset = index * 3
+            failed.append(
+                {
+                    **seed,
+                    "_seed_order": index,
+                    "fit_success": False,
+                    "reason": "bayesian posterior unavailable; least-squares MAP kept only as initialization",
+                    "fit_backend": fit_backend,
+                    "fit_method": fit_method,
+                    "fit_model": "multi_component_physical_voigt",
+                    "parameter_estimator": "none_posterior_unavailable",
+                    "fit_pixel_mask_local": fit_mask,
+                    "model_local": np.full(len(velocity), np.nan, dtype=float),
+                    "combined_model_local": np.full(len(velocity), np.nan, dtype=float),
+                    "diagnostic_flags": ["bayesian_posterior_unavailable"],
+                    "diagnostic_warnings": ["least-squares MAP is not used as a public fit result"],
+                    "diagnostic_details": {"posterior_backend": parameter_summary.get("backend")},
+                }
+            )
+        return failed, np.full(len(velocity), np.nan, dtype=float), fit_mask
     combined_fit = model_for(params, vel_fit)
     norm_residual = (flux_fit - combined_fit) / err_fit
     chi2 = float(np.sum(np.square(norm_residual)))
@@ -434,7 +628,6 @@ def _fit_peak_group_once(
 
     combined_model_local = np.full(len(velocity), np.nan, dtype=float)
     combined_model_local[evaluation_mask] = model_for(params, velocity[evaluation_mask])
-    parameter_summary = _parameter_summary_from_posterior(nested_result, bounds=bounds_by_name)
 
     fitted: list[dict[str, Any]] = []
     for index, seed in enumerate(seeds):
@@ -442,6 +635,9 @@ def _fit_peak_group_once(
         logN = float(params[offset])
         b_kms = float(params[offset + 1])
         center_kms = float(params[offset + 2])
+        map_logN = float(map_params[offset])
+        map_b_kms = float(map_params[offset + 1])
+        map_center_kms = float(map_params[offset + 2])
         component_model_local = np.full(len(velocity), np.nan, dtype=float)
         component_model_local[evaluation_mask] = physical_component_flux_model(
             velocity[evaluation_mask],
@@ -464,6 +660,103 @@ def _fit_peak_group_once(
             damping_gamma_kms=damping_gamma_kms,
         )
         equivalent_width_velocity_kms = float(trapezoid(1.0 - fine_model, fine_velocity))
+        diagnostic_flags, diagnostic_warnings, diagnostic_details = _component_parameter_diagnostics(
+            index=index,
+            eval_logN=logN,
+            eval_b_kms=b_kms,
+            eval_center_kms=center_kms,
+            map_logN=map_logN,
+            map_b_kms=map_b_kms,
+            map_center_kms=map_center_kms,
+            parameter_summary=parameter_summary,
+            bounds_by_name=bounds_by_name,
+        )
+        explicit_saturated_siblings = [
+            int(other_index)
+            for other_index, other_seed in enumerate(seeds)
+            if other_index != index
+            and bool(seed.get("explicit_fit_control_source"))
+            and bool(other_seed.get("explicit_fit_control_source"))
+            and abs(float(other_seed.get("seed_velocity_kms", np.nan)) - float(seed.get("seed_velocity_kms", np.nan)))
+            <= max(160.0, 2.5 * max(float(seed.get("b_kms", b_kms)), float(other_seed.get("b_kms", b_kms)), 1.0))
+        ]
+        if len(seeds) > 1:
+            other_params = np.concatenate([params[:offset], params[offset + 3 :]])
+            other_model_fit = combined_physical_flux_model(
+                vel_fit,
+                other_params,
+                rest_wavelength_A=rest_wavelength_A,
+                oscillator_strength=oscillator_strength,
+                damping_gamma_kms=damping_gamma_kms,
+            )
+            component_fit = physical_component_flux_model(
+                vel_fit,
+                logN=logN,
+                b_kms=b_kms,
+                center_kms=center_kms,
+                rest_wavelength_A=rest_wavelength_A,
+                oscillator_strength=oscillator_strength,
+                damping_gamma_kms=damping_gamma_kms,
+            )
+            significant_component = np.isfinite(component_fit) & (component_fit < 0.65)
+            if significant_component.any():
+                component_min_flux = float(np.nanmin(component_fit[significant_component]))
+                other_median_flux = float(np.nanmedian(other_model_fit[significant_component]))
+                other_min_flux = float(np.nanmin(other_model_fit[significant_component]))
+                combined_min_flux = float(np.nanmin(combined_fit[significant_component]))
+                combined_saturated_pixels = np.isfinite(combined_fit) & (combined_fit < 0.08)
+                component_in_saturated_pixels = (
+                    np.isfinite(component_fit)
+                    & combined_saturated_pixels
+                    & (component_fit < 0.65)
+                )
+                other_in_saturated_pixels = (
+                    np.isfinite(other_model_fit)
+                    & combined_saturated_pixels
+                    & (other_model_fit < 0.65)
+                )
+                shared_saturated_pixels = int(np.sum(component_in_saturated_pixels & other_in_saturated_pixels))
+                diagnostic_details["saturation_overlap"] = {
+                    "component_min_flux": component_min_flux,
+                    "other_components_median_flux_on_component_absorption": other_median_flux,
+                    "other_components_min_flux_on_component_absorption": other_min_flux,
+                    "combined_min_flux": combined_min_flux,
+                    "n_fit_pixels": int(significant_component.sum()),
+                    "shared_saturated_fit_pixels": shared_saturated_pixels,
+                    "interpretation": (
+                        "Voigt components are transmission curves; total flux is a product, so saturated redundant "
+                        "components do not add linearly or make the combined model negative."
+                    ),
+                }
+                if (
+                    component_min_flux < 0.35
+                    and (other_median_flux < 0.45 or other_min_flux < 0.35 or shared_saturated_pixels >= 3)
+                ):
+                    diagnostic_flags.append("saturated_redundant_component")
+                    diagnostic_warnings.append(
+                        "component is fitted on pixels already made saturated by other components; residuals may not penalize it"
+                    )
+        if explicit_saturated_siblings and logN >= 15.0 and b_kms >= 5.0:
+            seed_velocity = float(seed.get("seed_velocity_kms", center_kms))
+            seed_half_width = max(45.0, 0.75 * float(seed.get("b_kms", b_kms)))
+            local_seed_region = np.isfinite(vel_fit) & (np.abs(vel_fit - seed_velocity) <= seed_half_width)
+            local_seed_min_flux = float(np.nanmin(flux_fit[local_seed_region])) if local_seed_region.any() else float("nan")
+            diagnostic_details.setdefault("saturation_overlap", {})
+            diagnostic_details["saturation_overlap"].update(
+                {
+                    "explicit_saturated_sibling_seed_orders": explicit_saturated_siblings,
+                    "local_seed_region_min_flux": local_seed_min_flux,
+                    "explicit_sibling_interpretation": (
+                        "Multiple explicit sources were placed on one saturated trough; in black/near-black pixels "
+                        "residuals cannot reliably distinguish extra Voigt components."
+                    ),
+                }
+            )
+            if np.isfinite(local_seed_min_flux) and local_seed_min_flux < 0.12:
+                diagnostic_flags.append("saturated_redundant_component")
+                diagnostic_warnings.append(
+                    "explicit source sits on a saturated trough already represented by nearby explicit sources"
+                )
         fitted.append(
             {
                 **seed,
@@ -472,6 +765,7 @@ def _fit_peak_group_once(
                 "reason": fit_reason,
                 "fit_backend": fit_backend,
                 "fit_method": fit_method,
+                "parameter_estimator": "posterior_median" if parameter_summary.get("backend") == "ultranest" else "none_posterior_unavailable",
                 "fit_model": "multi_component_physical_voigt",
                 "fit_window_half_width_kms": float(local_fit_half_width_kms),
                 "center_velocity_kms": center_kms,
@@ -490,7 +784,6 @@ def _fit_peak_group_once(
                     "b_kms": _component_interval(parameter_summary, f"b_kms_{index}", b_kms),
                     "center_velocity_kms": _component_interval(parameter_summary, f"center_velocity_kms_{index}", center_kms),
                 },
-                "fit_parameter_summary": parameter_summary,
                 "chi2": chi2,
                 "reduced_chi2": reduced_chi2,
                 "fit_rms": fit_rms,
@@ -499,18 +792,23 @@ def _fit_peak_group_once(
                 "fit_pixel_mask_local": fit_mask,
                 "model_local": component_model_local,
                 "combined_model_local": combined_model_local,
-                "map_parameters": {
-                    "logN": logN,
-                    "b_kms": b_kms,
-                    "center_velocity_kms": center_kms,
-                },
+                "diagnostic_flags": sorted(set(diagnostic_flags)),
+                "diagnostic_warnings": sorted(set(diagnostic_warnings)),
+                "diagnostic_details": diagnostic_details,
             }
         )
     return fitted, combined_model_local, fit_mask
 
 
 def _public_peak(peak: dict[str, Any]) -> dict[str, Any]:
-    private = {"fit_pixel_mask_local", "model_local", "combined_model_local", "_seed_order"}
+    private = {
+        "fit_pixel_mask_local",
+        "model_local",
+        "combined_model_local",
+        "_seed_order",
+        "map_parameters",
+        "fit_parameter_summary",
+    }
     return {key: value for key, value in peak.items() if key not in private}
 
 
@@ -525,6 +823,19 @@ def _frame_quality(peaks: list[dict[str, Any]], flux: np.ndarray, good: np.ndarr
         warnings.append("many components in one transition frame; model needs review")
         reasons.append("many_components_in_transition_frame")
     for peak in successful:
+        for flag in peak.get("diagnostic_flags", []):
+            if flag == "bayesian_posterior_unavailable":
+                warnings.append("bayesian posterior unavailable for this transition frame")
+                reasons.append("bayesian_posterior_unavailable")
+            elif flag == "saturated_redundant_component":
+                warnings.append("redundant component in already saturated model region")
+                reasons.append("saturated_redundant_component")
+            elif flag in {"component_parameter_posterior_degenerate", "component_parameter_posterior_disagrees_with_map"}:
+                warnings.append("component posterior is degenerate relative to the initialization")
+                reasons.append("component_parameter_posterior_degenerate")
+            elif flag == "component_at_parameter_bound":
+                warnings.append("component parameter is near a fit bound")
+                reasons.append("component_at_parameter_bound")
         if float(peak.get("fit_rms", 0.0)) > 3.0:
             warnings.append("high residual around a fitted peak")
             reasons.append("high_residual_transition_peak")
@@ -585,6 +896,8 @@ def fit_voigt_absorption(
     transition_frames: list[dict[str, Any]] = []
     global_model = np.full(len(output), np.nan, dtype=float)
     global_fit_mask = np.zeros(len(output), dtype=bool)
+    frame_fit_residuals: list[np.ndarray] = []
+    frame_work_residuals: list[np.ndarray] = []
     component_index = 0
     review_reasons: list[str] = []
 
@@ -599,7 +912,11 @@ def fit_voigt_absorption(
         observed_center_A = rest_A * (1.0 + z_sys)
         velocity = transition_velocity_kms(wavelength, observed_center_A)
         frame_mask = np.abs(velocity) <= frame_half_width_kms
+        source_fit_half_width_kms = float(window_control.get("source_fit_half_width_kms", SOURCE_WORK_WINDOW_KMS[1]))
+        source_fit_half_width_kms = float(np.clip(source_fit_half_width_kms, 80.0, frame_half_width_kms))
+        source_fit_mask = np.abs(velocity) <= source_fit_half_width_kms
         frame_good = good_all & frame_mask
+        fit_good = frame_good & source_fit_mask
         sibling_mask_mode = str(window_control.get("sibling_mask_mode", "exclude"))
         if sibling_mask_mode == "allow_overlap":
             sibling_intervals = []
@@ -612,6 +929,8 @@ def fit_voigt_absorption(
             )
         frame_good = _apply_fit_mask_intervals(velocity, frame_good, transition_line_id, sibling_intervals)
         frame_good = _apply_fit_mask_intervals(velocity, frame_good, transition_line_id, controls.get("fit_mask_intervals", []))
+        fit_good = _apply_fit_mask_intervals(velocity, fit_good, transition_line_id, sibling_intervals)
+        fit_good = _apply_fit_mask_intervals(velocity, fit_good, transition_line_id, controls.get("fit_mask_intervals", []))
         output.loc[frame_mask, "voigt_transition_id"] = transition_line_id
         output.loc[frame_mask, "transition_velocity_kms"] = velocity[frame_mask]
 
@@ -632,13 +951,15 @@ def fit_voigt_absorption(
             "simultaneous_fit_window": {
                 "bounds_kms": [-frame_half_width_kms, frame_half_width_kms],
                 "masked_by": "good pixels, sibling transition projections, and fit_control mask intervals",
+                "source_fit_bounds_kms": [-source_fit_half_width_kms, source_fit_half_width_kms],
+                "source_fit_policy": "Voigt parameters are fit in the source work window by default; context pixels are diagnostic unless set_fit_window expands source_fit_half_width_kms.",
                 "model": "all retained components in this transition frame are fit together with physical logN/b/v parameters",
                 "sibling_mask_mode": sibling_mask_mode,
             },
             "sibling_transition_masks": sibling_intervals,
             "peaks": [],
         }
-        if int(frame_good.sum()) < 8:
+        if int(fit_good.sum()) < 8:
             frame_record.update(
                 {
                     "success": False,
@@ -652,14 +973,18 @@ def fit_voigt_absorption(
             transition_frames.append(frame_record)
             continue
 
-        seeds = detect_absorption_peaks(
-            velocity[frame_mask],
-            normalized_flux[frame_mask],
-            min_peak_depth=min_peak_depth,
-            max_peaks=max_peaks_per_transition,
-            min_separation_kms=min_peak_separation_kms,
-            good=frame_good[frame_mask],
-        )
+        source_detection_mode = str(controls.get("source_detection_mode", "auto"))
+        if source_detection_mode == "controlled":
+            seeds = []
+        else:
+            seeds = detect_absorption_peaks(
+                velocity[frame_mask],
+                normalized_flux[frame_mask],
+                min_peak_depth=min_peak_depth,
+                max_peaks=max_peaks_per_transition,
+                min_separation_kms=min_peak_separation_kms,
+                good=fit_good[frame_mask],
+            )
         seeds = _merge_control_source_seeds(
             seeds,
             transition_line_id=transition_line_id,
@@ -672,35 +997,78 @@ def fit_voigt_absorption(
             transition_line_id=transition_line_id,
             controls=controls,
         )
+        frame_indices = np.flatnonzero(frame_mask)
+        frame_velocity = velocity[frame_mask]
+        frame_flux = normalized_flux[frame_mask]
+        frame_ivar = normalized_ivar[frame_mask]
+        frame_good_local = frame_good[frame_mask]
+        fit_good_local = fit_good[frame_mask]
         if not seeds:
+            null_model_local = np.ones_like(frame_flux, dtype=float)
+            null_fit_mask = fit_good_local & np.isfinite(frame_flux) & np.isfinite(frame_ivar) & (frame_ivar > 0.0)
+            if null_fit_mask.any():
+                global_fit_mask[frame_indices[null_fit_mask]] = True
+                fill = ~np.isfinite(global_model[frame_indices[null_fit_mask]])
+                target_indices = frame_indices[null_fit_mask]
+                global_model[target_indices[fill]] = null_model_local[null_fit_mask][fill]
+                global_model[target_indices[~fill]] = np.minimum(
+                    global_model[target_indices[~fill]],
+                    null_model_local[null_fit_mask][~fill],
+                )
+            residual_samples = _frame_residual_samples(
+                wavelength[frame_mask],
+                frame_velocity,
+                frame_flux,
+                frame_ivar,
+                null_model_local,
+                null_fit_mask,
+            )
+            diagnostic_residual_samples = _frame_diagnostic_residual_samples(
+                wavelength[frame_mask],
+                frame_velocity,
+                frame_flux,
+                frame_ivar,
+                null_model_local,
+                frame_good_local & np.isfinite(frame_flux) & np.isfinite(frame_ivar) & (frame_ivar > 0.0),
+                null_fit_mask,
+            )
+            _append_frame_residuals(residual_samples, frame_fit_residuals, frame_work_residuals)
+            frame_residual_metrics = _residual_metrics_from_samples(residual_samples)
+            frame_work_metrics = _residual_metrics_from_samples(
+                sample
+                for sample in residual_samples
+                if SOURCE_WORK_WINDOW_KMS[0] <= float(sample.get("velocity_kms", np.nan)) <= SOURCE_WORK_WINDOW_KMS[1]
+            )
             frame_record.update(
                 {
                     "success": False,
                     "quality": "failed",
                     "agent_review_required": True,
                     "agent_review_reasons": ["no_absorption_peak_detected_in_transition_frame"],
-                    "reason": "no absorption peak above depth threshold after sibling/mask exclusions",
+                    "reason": "no absorption peak above depth threshold after sibling/mask exclusions; residuals use a flat no-source model",
                     "peak_detection": {
                         "method": "find_peaks_on_smoothed_absorption_depth_with_center_priors",
                         "min_peak_depth": float(min_peak_depth),
                         "max_peaks_per_transition": int(max_peaks_per_transition),
+                        "source_detection_mode": source_detection_mode,
                     },
+                    "n_successful_peak_fits": 0,
+                    "fit_metrics": frame_residual_metrics,
+                    "source_work_window_metrics": frame_work_metrics,
+                    "residual_model": "flat_no_source_model",
+                    "residual_samples": residual_samples,
+                    "diagnostic_residual_samples": diagnostic_residual_samples,
                 }
             )
             review_reasons.extend(frame_record["agent_review_reasons"])
             transition_frames.append(frame_record)
             continue
 
-        frame_indices = np.flatnonzero(frame_mask)
-        frame_velocity = velocity[frame_mask]
-        frame_flux = normalized_flux[frame_mask]
-        frame_ivar = normalized_ivar[frame_mask]
-        frame_good_local = frame_good[frame_mask]
         fitted_peaks, combined_model_local, combined_fit_mask = _fit_peak_group(
             frame_velocity,
             frame_flux,
             frame_ivar,
-            frame_good_local,
+            fit_good_local,
             seeds=seeds,
             local_fit_half_width_kms=frame_local_half_width_kms,
             center_shift_limit_kms=center_shift_limit_kms,
@@ -718,6 +1086,30 @@ def fit_voigt_absorption(
             global_model[full_indices[~fill]] = np.minimum(global_model[full_indices[~fill]], full_model[~fill])
         if combined_fit_mask.any():
             global_fit_mask[frame_indices[combined_fit_mask]] = True
+        residual_samples = _frame_residual_samples(
+            wavelength[frame_mask],
+            frame_velocity,
+            frame_flux,
+            frame_ivar,
+            combined_model_local,
+            combined_fit_mask,
+        )
+        diagnostic_residual_samples = _frame_diagnostic_residual_samples(
+            wavelength[frame_mask],
+            frame_velocity,
+            frame_flux,
+            frame_ivar,
+            combined_model_local,
+            frame_good_local,
+            combined_fit_mask,
+        )
+        _append_frame_residuals(residual_samples, frame_fit_residuals, frame_work_residuals)
+        frame_residual_metrics = _residual_metrics_from_samples(residual_samples)
+        frame_work_metrics = _residual_metrics_from_samples(
+            sample
+            for sample in residual_samples
+            if SOURCE_WORK_WINDOW_KMS[0] <= float(sample.get("velocity_kms", np.nan)) <= SOURCE_WORK_WINDOW_KMS[1]
+        )
 
         for fitted in fitted_peaks:
             fitted["component_index"] = int(component_index)
@@ -732,7 +1124,7 @@ def fit_voigt_absorption(
             component_index += 1
 
         successful_peaks = [peak for peak in fitted_peaks if peak.get("fit_success")]
-        quality, warnings, frame_review_reasons = _frame_quality(fitted_peaks, frame_flux, frame_good_local)
+        quality, warnings, frame_review_reasons = _frame_quality(fitted_peaks, frame_flux, fit_good_local)
         review_reasons.extend(frame_review_reasons)
         frame_record.update(
             {
@@ -747,8 +1139,13 @@ def fit_voigt_absorption(
                     "min_peak_separation_kms": float(min_peak_separation_kms),
                     "n_detected_peaks": int(len(seeds)),
                     "center_use": "detected centers are prior means, not fixed fit centers",
+                    "source_detection_mode": source_detection_mode,
                 },
                 "n_successful_peak_fits": int(len(successful_peaks)),
+                "fit_metrics": frame_residual_metrics,
+                "source_work_window_metrics": frame_work_metrics,
+                "residual_samples": residual_samples,
+                "diagnostic_residual_samples": diagnostic_residual_samples,
                 "peaks": [_public_peak(peak) for peak in fitted_peaks],
             }
         )
@@ -780,13 +1177,21 @@ def fit_voigt_absorption(
         )
         output.loc[peak_mask, "voigt_component_index"] = int(peak["component_index"])
 
-    if global_fit_mask.any():
-        finite_resid = output.loc[global_fit_mask, "voigt_residual_sigma"].to_numpy(dtype=float)
+    if frame_fit_residuals:
+        finite_resid = np.concatenate(frame_fit_residuals)
         finite_resid = finite_resid[np.isfinite(finite_resid)]
-        fit_rms = float(np.sqrt(np.mean(np.square(finite_resid)))) if len(finite_resid) else float("nan")
     else:
+        finite_resid = np.array([], dtype=float)
+    n_fit_pixels = int(len(finite_resid))
+    if n_fit_pixels:
+        chi2 = float(np.sum(np.square(finite_resid)))
+        reduced_chi2 = float(chi2 / n_fit_pixels)
+        fit_rms = float(np.sqrt(reduced_chi2))
+    else:
+        chi2 = float("nan")
+        reduced_chi2 = float("nan")
         fit_rms = float("nan")
-    work_window_metrics = _source_work_window_metrics(output)
+    work_window_metrics = _source_work_window_metrics_from_residuals(frame_work_residuals)
 
     unique_review_reasons = sorted(set(review_reasons))
     success = any(frame.get("success") for frame in transition_frames)
@@ -807,9 +1212,11 @@ def fit_voigt_absorption(
         "status": status,
         "quality": quality,
         "n_good_pixels": int(good_all.sum()),
-        "n_fit_pixels": int(global_fit_mask.sum()),
+        "n_fit_pixels": n_fit_pixels,
         "n_transition_frames": int(len(transition_frames)),
         "n_components_fitted": int(len(fitted_public_peaks)),
+        "chi2": chi2,
+        "reduced_chi2": reduced_chi2,
         "fit_rms": fit_rms,
         "source_work_window_kms": list(SOURCE_WORK_WINDOW_KMS),
         "source_work_window_metrics": work_window_metrics,
@@ -1011,12 +1418,160 @@ def _fit_control_summary(controls: dict[str, Any]) -> dict[str, Any]:
         "n_fit_mask_intervals": int(len(controls.get("fit_mask_intervals", []))),
         "n_fit_windows": int(len(controls.get("fit_windows", {}))),
         "fit_mask_intervals": controls.get("fit_mask_intervals", []),
+        "continuum_anchor_remove_wavelengths_A": controls.get("continuum_anchor_remove_wavelengths_A", []),
+        "continuum_mask_intervals_A": controls.get("continuum_mask_intervals_A", []),
+    }
+
+
+def _frame_residual_samples(
+    wavelength: np.ndarray,
+    velocity: np.ndarray,
+    flux: np.ndarray,
+    ivar: np.ndarray,
+    model: np.ndarray,
+    fit_mask: np.ndarray,
+) -> list[dict[str, float]]:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        err = np.where(ivar > 0.0, 1.0 / np.sqrt(ivar), np.nan)
+        residual = flux - model
+        residual_sigma = residual / err
+    selected = fit_mask & np.isfinite(wavelength) & np.isfinite(velocity) & np.isfinite(model) & np.isfinite(residual_sigma)
+    samples: list[dict[str, float]] = []
+    for wave_A, vel_kms, model_flux, resid, resid_sigma in zip(
+        wavelength[selected],
+        velocity[selected],
+        model[selected],
+        residual[selected],
+        residual_sigma[selected],
+        strict=True,
+    ):
+        samples.append(
+            {
+                "wavelength_A": float(wave_A),
+                "velocity_kms": float(vel_kms),
+                "model_flux": float(model_flux),
+                "residual": float(resid),
+                "residual_sigma": float(resid_sigma),
+            }
+        )
+    return samples
+
+
+def _frame_diagnostic_residual_samples(
+    wavelength: np.ndarray,
+    velocity: np.ndarray,
+    flux: np.ndarray,
+    ivar: np.ndarray,
+    model: np.ndarray,
+    good_mask: np.ndarray,
+    fit_mask: np.ndarray,
+) -> list[dict[str, float]]:
+    samples = _frame_residual_samples(wavelength, velocity, flux, ivar, model, good_mask)
+    fit_mask = np.asarray(fit_mask, dtype=bool)
+    selected_indices = np.flatnonzero(
+        np.asarray(good_mask, dtype=bool)
+        & np.isfinite(wavelength)
+        & np.isfinite(velocity)
+        & np.isfinite(model)
+    )
+    for sample, index in zip(samples, selected_indices, strict=True):
+        sample["used_in_fit"] = bool(fit_mask[index])
+    return samples
+
+
+def _append_frame_residuals(
+    residual_samples: list[dict[str, float]],
+    frame_fit_residuals: list[np.ndarray],
+    frame_work_residuals: list[np.ndarray],
+) -> None:
+    if not residual_samples:
+        return
+    sample_residuals = np.asarray([sample["residual_sigma"] for sample in residual_samples], dtype=float)
+    sample_velocities = np.asarray([sample["velocity_kms"] for sample in residual_samples], dtype=float)
+    finite_sample_residuals = sample_residuals[np.isfinite(sample_residuals)]
+    if not len(finite_sample_residuals):
+        return
+    frame_fit_residuals.append(finite_sample_residuals)
+    in_work = (
+        np.isfinite(sample_velocities)
+        & np.isfinite(sample_residuals)
+        & (sample_velocities >= SOURCE_WORK_WINDOW_KMS[0])
+        & (sample_velocities <= SOURCE_WORK_WINDOW_KMS[1])
+    )
+    if in_work.any():
+        frame_work_residuals.append(sample_residuals[in_work])
+
+
+def _source_work_window_metrics_from_residuals(frame_work_residuals: list[np.ndarray]) -> dict[str, Any]:
+    if not frame_work_residuals:
+        return {
+            "n_fit_pixels": 0,
+            "chi2": float("nan"),
+            "reduced_chi2": float("nan"),
+            "fit_rms": float("nan"),
+            "max_abs_residual_sigma": float("nan"),
+        }
+    values = np.concatenate(frame_work_residuals)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return {
+            "n_fit_pixels": 0,
+            "chi2": float("nan"),
+            "reduced_chi2": float("nan"),
+            "fit_rms": float("nan"),
+            "max_abs_residual_sigma": float("nan"),
+        }
+    chi2 = float(np.sum(np.square(values)))
+    reduced_chi2 = float(chi2 / len(values))
+    return {
+        "n_fit_pixels": int(len(values)),
+        "chi2": chi2,
+        "reduced_chi2": reduced_chi2,
+        "fit_rms": float(np.sqrt(reduced_chi2)),
+        "max_abs_residual_sigma": float(np.nanmax(np.abs(values))),
+    }
+
+
+def _residual_metrics_from_samples(samples: Any) -> dict[str, Any]:
+    residuals: list[float] = []
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        try:
+            residual_sigma = float(sample.get("residual_sigma"))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(residual_sigma):
+            residuals.append(residual_sigma)
+    values = np.asarray(residuals, dtype=float)
+    if len(values) == 0:
+        return {
+            "n_fit_pixels": 0,
+            "chi2": float("nan"),
+            "reduced_chi2": float("nan"),
+            "fit_rms": float("nan"),
+            "max_abs_residual_sigma": float("nan"),
+        }
+    chi2 = float(np.sum(np.square(values)))
+    reduced_chi2 = float(chi2 / len(values))
+    return {
+        "n_fit_pixels": int(len(values)),
+        "chi2": chi2,
+        "reduced_chi2": reduced_chi2,
+        "fit_rms": float(np.sqrt(reduced_chi2)),
+        "max_abs_residual_sigma": float(np.nanmax(np.abs(values))),
     }
 
 
 def _source_work_window_metrics(output: pd.DataFrame) -> dict[str, Any]:
     if "transition_velocity_kms" not in output.columns or "voigt_residual_sigma" not in output.columns:
-        return {"n_fit_pixels": 0, "fit_rms": float("nan"), "max_abs_residual_sigma": float("nan")}
+        return {
+            "n_fit_pixels": 0,
+            "chi2": float("nan"),
+            "reduced_chi2": float("nan"),
+            "fit_rms": float("nan"),
+            "max_abs_residual_sigma": float("nan"),
+        }
     velocity = output["transition_velocity_kms"].to_numpy(dtype=float)
     residual = output["voigt_residual_sigma"].to_numpy(dtype=float)
     fit_pixel = output["is_voigt_fit_pixel"].to_numpy(dtype=bool) if "is_voigt_fit_pixel" in output.columns else np.isfinite(residual)
@@ -1028,10 +1583,20 @@ def _source_work_window_metrics(output: pd.DataFrame) -> dict[str, Any]:
         & (velocity <= SOURCE_WORK_WINDOW_KMS[1])
     )
     if not selected.any():
-        return {"n_fit_pixels": 0, "fit_rms": float("nan"), "max_abs_residual_sigma": float("nan")}
+        return {
+            "n_fit_pixels": 0,
+            "chi2": float("nan"),
+            "reduced_chi2": float("nan"),
+            "fit_rms": float("nan"),
+            "max_abs_residual_sigma": float("nan"),
+        }
     values = residual[selected]
+    chi2 = float(np.sum(np.square(values)))
+    reduced_chi2 = float(chi2 / len(values))
     return {
         "n_fit_pixels": int(len(values)),
-        "fit_rms": float(np.sqrt(np.mean(np.square(values)))),
+        "chi2": chi2,
+        "reduced_chi2": reduced_chi2,
+        "fit_rms": float(np.sqrt(reduced_chi2)),
         "max_abs_residual_sigma": float(np.nanmax(np.abs(values))),
     }

@@ -291,42 +291,43 @@ def build_review_record_from_window(
 def build_fit_control_hints(plot_window: pd.DataFrame, fit_summary: dict[str, Any]) -> dict[str, Any]:
     """Build deterministic hints for the LLM tool loop from fit residuals."""
     hints: list[dict[str, Any]] = []
-    if "transition_velocity_kms" not in plot_window.columns or "voigt_residual_sigma" not in plot_window.columns:
-        return {"hints": hints}
 
     transition_half_width = float(fit_summary.get("transition_half_width_kms", 600.0))
+    overlap_lookup = _frame_overlap_lookup(fit_summary)
     for frame in fit_summary.get("transition_frames", []):
         transition_line_id = str(frame.get("transition_line_id", ""))
         if not transition_line_id:
             continue
-        selected = (
-            (plot_window["voigt_transition_id"].astype(str) == transition_line_id)
-            & (plot_window.get("is_voigt_fit_pixel", 0).astype(bool))
-        )
-        if not selected.any():
+        velocity, residual = _frame_residual_arrays(frame, plot_window, transition_line_id)
+        if len(velocity) == 0:
             continue
-        frame_data = plot_window.loc[selected].sort_values("transition_velocity_kms")
-        velocity = frame_data["transition_velocity_kms"].to_numpy(dtype=float)
-        residual = frame_data["voigt_residual_sigma"].to_numpy(dtype=float)
         finite = np.isfinite(velocity) & np.isfinite(residual)
         strong_negative = finite & (residual <= -3.0)
         for group in _boolean_groups(strong_negative):
-            if len(group) < 2:
+            depth = float(np.nanmin(residual[group])) if len(group) else float("nan")
+            if len(group) < 2 and (not np.isfinite(depth) or depth > -5.0):
                 continue
             lower_v = float(np.nanmin(velocity[group]))
             upper_v = float(np.nanmax(velocity[group]))
             center = float(np.nanmedian(velocity[group]))
             width = float(upper_v - lower_v)
-            depth = float(np.nanmin(residual[group]))
             in_core_window = SOURCE_CORE_WINDOW_KMS[0] <= center <= SOURCE_CORE_WINDOW_KMS[1]
             touches_work_window = upper_v >= SOURCE_WORK_WINDOW_KMS[0] and lower_v <= SOURCE_WORK_WINDOW_KMS[1]
             in_boundary_band = touches_work_window and not in_core_window
+            overlap_matches = _matching_velocity_overlap_intervals(transition_line_id, center, overlap_lookup)
+            in_velocity_overlap = bool(overlap_matches)
+            high_sigma_context = (not in_core_window) and depth <= -5.0
             kind = (
                 "source_work_window_residual"
                 if in_core_window
-                else ("source_boundary_residual" if in_boundary_band else "context_only_residual")
+                else (
+                    "source_boundary_residual"
+                    if in_boundary_band
+                    else ("high_sigma_context_mask_candidate" if high_sigma_context else "context_only_residual")
+                )
             )
-            suggested_action = "consider add_absorption_source or update_absorption_source"
+            suggested_action = "inspect wavelength overview first; only add/update a source if the feature is target absorption"
+            preferred_action = "add_or_update_absorption_source" if in_core_window and not in_velocity_overlap else "set_fit_mask_interval_or_human_review"
             payload: dict[str, Any] = {
                 "kind": kind,
                 "transition_line_id": transition_line_id,
@@ -334,6 +335,9 @@ def build_fit_control_hints(plot_window: pd.DataFrame, fit_summary: dict[str, An
                 "velocity_range_kms": [lower_v, upper_v],
                 "width_kms": width,
                 "min_residual_sigma": depth,
+                "in_velocity_frame_overlap": in_velocity_overlap,
+                "overlap_intervals": overlap_matches,
+                "preferred_action": preferred_action,
                 "suggested_action": suggested_action,
             }
             if in_boundary_band:
@@ -341,16 +345,27 @@ def build_fit_control_hints(plot_window: pd.DataFrame, fit_summary: dict[str, An
                 payload.update(
                     {
                         "suggested_fit_mask_interval_kms": [center - pad, center + pad],
-                        "suggested_action": "boundary band; either add a boundary source or cover the full contaminant with a narrow set_fit_mask_interval, do not leave it half handled",
+                        "preferred_action": "set_fit_mask_interval_or_human_review",
+                        "suggested_action": (
+                            "boundary band; inspect wavelength overview first. If the feature is projected/overlap/another-line "
+                            "contamination, use a narrow set_fit_mask_interval; add/update a source only if it is visibly target absorption"
+                        ),
                     }
                 )
             elif not in_core_window:
                 pad = max(12.0, min(35.0, 0.5 * width + 8.0))
+                context_kind = "high_sigma_context_mask_candidate" if high_sigma_context else "context_only_mask_candidate"
+                action = (
+                    "high-sigma context residual; use a narrow set_fit_mask_interval exclude or explicitly explain why this red residual is acceptable"
+                    if high_sigma_context
+                    else "context only; consider a narrow set_fit_mask_interval exclude only if it contaminates the source work window"
+                )
                 payload.update(
                     {
-                        "kind": "context_only_mask_candidate",
+                        "kind": context_kind,
                         "suggested_fit_mask_interval_kms": [center - pad, center + pad],
-                        "suggested_action": "context only; consider a narrow set_fit_mask_interval exclude only if it contaminates the source work window",
+                        "preferred_action": "set_fit_mask_interval_or_human_review",
+                        "suggested_action": action,
                     }
                 )
             hints.append(payload)
@@ -366,9 +381,128 @@ def build_fit_control_hints(plot_window: pd.DataFrame, fit_summary: dict[str, An
     return {
         "source_work_window_kms": list(SOURCE_WORK_WINDOW_KMS),
         "source_core_window_kms": list(SOURCE_CORE_WINDOW_KMS),
-        "priority_order": ["source_work_window_residual", "source_boundary_residual", "context_only_mask_candidate"],
+        "priority_order": [
+            "source_work_window_residual",
+            "source_boundary_residual",
+            "high_sigma_context_mask_candidate",
+            "context_only_mask_candidate",
+        ],
         "hints": selected,
     }
+
+
+def _frame_residual_arrays(
+    frame: dict[str, Any],
+    plot_window: pd.DataFrame,
+    transition_line_id: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    samples = frame.get("residual_samples", [])
+    if isinstance(samples, list) and samples:
+        rows = [
+            (float(sample.get("velocity_kms")), float(sample.get("residual_sigma")))
+            for sample in samples
+            if _finite_number(sample.get("velocity_kms")) and _finite_number(sample.get("residual_sigma"))
+        ]
+        rows.sort(key=lambda item: item[0])
+        return (
+            np.asarray([item[0] for item in rows], dtype=float),
+            np.asarray([item[1] for item in rows], dtype=float),
+        )
+    if "transition_velocity_kms" not in plot_window.columns or "voigt_residual_sigma" not in plot_window.columns:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    selected = (
+        (plot_window["voigt_transition_id"].astype(str) == transition_line_id)
+        & (plot_window.get("is_voigt_fit_pixel", 0).astype(bool))
+    )
+    if not selected.any():
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    frame_data = plot_window.loc[selected].sort_values("transition_velocity_kms")
+    return (
+        frame_data["transition_velocity_kms"].to_numpy(dtype=float),
+        frame_data["voigt_residual_sigma"].to_numpy(dtype=float),
+    )
+
+
+def _finite_number(value: Any) -> bool:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(np.isfinite(parsed))
+
+
+def _frame_overlap_lookup(fit_summary: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    frames: list[dict[str, Any]] = []
+    for frame in fit_summary.get("transition_frames", []):
+        transition_line_id = str(frame.get("transition_line_id", ""))
+        observed_center = _finite_or_none(frame.get("observed_center_A"))
+        bounds = frame.get("velocity_frame", {}).get("bounds_kms")
+        if not transition_line_id or observed_center is None or not isinstance(bounds, list) or len(bounds) != 2:
+            continue
+        lower_v = _finite_or_none(bounds[0])
+        upper_v = _finite_or_none(bounds[1])
+        if lower_v is None or upper_v is None:
+            continue
+        lower_v, upper_v = sorted((lower_v, upper_v))
+        frames.append(
+            {
+                "transition_line_id": transition_line_id,
+                "observed_center_A": observed_center,
+                "wavelength_interval_A": _velocity_interval_to_wavelength_A(observed_center, lower_v, upper_v),
+            }
+        )
+    lookup: dict[str, list[dict[str, Any]]] = {}
+    for index, left in enumerate(frames):
+        for right in frames[index + 1 :]:
+            lower_A = max(left["wavelength_interval_A"][0], right["wavelength_interval_A"][0])
+            upper_A = min(left["wavelength_interval_A"][1], right["wavelength_interval_A"][1])
+            if lower_A >= upper_A:
+                continue
+            for current, other in ((left, right), (right, left)):
+                current_center = current["observed_center_A"]
+                lookup.setdefault(current["transition_line_id"], []).append(
+                    {
+                        "other_transition_line_id": other["transition_line_id"],
+                        "overlap_wavelength_A": [lower_A, upper_A],
+                        "overlap_velocity_kms": [
+                            _wavelength_to_velocity_kms(current_center, lower_A),
+                            _wavelength_to_velocity_kms(current_center, upper_A),
+                        ],
+                    }
+                )
+    return lookup
+
+
+def _matching_velocity_overlap_intervals(
+    transition_line_id: str,
+    center_velocity_kms: float,
+    overlap_lookup: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for interval in overlap_lookup.get(transition_line_id, []):
+        lower, upper = sorted(float(value) for value in interval.get("overlap_velocity_kms", []))
+        if lower <= center_velocity_kms <= upper:
+            matches.append(interval)
+    return matches
+
+
+def _velocity_interval_to_wavelength_A(observed_center_A: float, lower_velocity_kms: float, upper_velocity_kms: float) -> list[float]:
+    return [
+        observed_center_A * (1.0 + lower_velocity_kms / 299792.458),
+        observed_center_A * (1.0 + upper_velocity_kms / 299792.458),
+    ]
+
+
+def _wavelength_to_velocity_kms(observed_center_A: float, wavelength_A: float) -> float:
+    return 299792.458 * (wavelength_A / observed_center_A - 1.0)
+
+
+def _finite_or_none(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if np.isfinite(parsed) else None
 
 
 def _boolean_groups(mask: np.ndarray) -> list[np.ndarray]:

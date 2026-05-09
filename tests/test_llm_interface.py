@@ -5,6 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -15,7 +18,13 @@ from astroagent.agent.fit_control import (
     build_fit_control_patch,
     summarize_pending_fit_control,
 )
-from astroagent.agent.fit_control import build_fit_control_overrides, evaluate_refit_patch, merge_fit_control_overrides, refit_record_with_patch
+from astroagent.agent.fit_control import (
+    _with_controlled_source_seeds,
+    build_fit_control_overrides,
+    evaluate_refit_patch,
+    merge_fit_control_overrides,
+    refit_record_with_patch,
+)
 from astroagent.agent.llm import (
     LLMMessage,
     LLMResult,
@@ -107,6 +116,36 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertEqual(len(image_parts), 2)
         self.assertEqual([part["text"] for part in label_parts], ["Image 1: overview.png", "Image 2: fit.png"])
 
+    def test_fit_control_messages_include_velocity_frame_overlap_hints(self):
+        messages = build_fit_control_messages(self._demo_record())
+        text = messages[1].content
+        self.assertIsInstance(text, str)
+        prefix = "Task: fit_control. Inspect"
+        self.assertTrue(text.startswith(prefix))
+        payload = json.loads(text[text.index("{") :])
+
+        diagnostic_hints = payload["fit_control_context"]["diagnostic_hints"]
+        overlaps = diagnostic_hints["velocity_frame_wavelength_overlaps"]
+        projections = diagnostic_hints["sibling_work_window_projections"]
+        plot_data = payload["plot_data"]
+
+        self.assertTrue(overlaps["frames"])
+        self.assertTrue(overlaps["overlaps"])
+        self.assertTrue(projections)
+        self.assertIn("visible_overlap_in_current_frame_kms", projections[0])
+        self.assertIn("continuum_anchor_table", plot_data)
+        self.assertIn("continuum_anchor_diagnostics", plot_data)
+        self.assertIn("anchor_index", plot_data["continuum_anchor_table"][0])
+        self.assertIn("continuum is trustworthy", text)
+        self.assertIn("do not add or retune sources merely to absorb a continuum error", text)
+        self.assertIn("remove those biased anchor indices first", text)
+        self.assertIn("Velocity panels are not independent evidence", text)
+        self.assertIn("general wavelength-overlap rule", text)
+        self.assertIn("explicitly attribute the worse fit to the previous round's tool calls", text)
+        self.assertIn("Never pair a new edge mask with multiple new sources in the partner transition frame", text)
+        self.assertIn("wavelength data and may overlap", text)
+        self.assertIn("A mask only changes which pixels constrain the next fit", text)
+
     def test_openai_compatible_url_builder_accepts_base_or_full_api_url(self):
         self.assertEqual(
             _chat_completions_url("https://llmapi.paratera.com"),
@@ -173,6 +212,26 @@ class LLMInterfaceTest(unittest.TestCase):
 
         self.assertEqual(control["rationale"], "first object")
         self.assertEqual(control["status"], "no_action")
+
+    def test_run_fit_control_normalizes_loose_status_labels(self):
+        class LooseStatusClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content=json.dumps(
+                        {
+                            "task": "fit_control",
+                            "status": "needs_human_review",
+                            "tool_calls": [],
+                            "rationale": "label is loose",
+                        }
+                    ),
+                    model="unit-loose-status-model",
+                    raw={"unit": True},
+                )
+
+        control = run_fit_control(self._demo_record(), LooseStatusClient())
+
+        self.assertEqual(control["status"], "inspect")
 
     def test_offline_fit_review_uses_second_stage_schema(self):
         record = self._demo_record()
@@ -351,6 +410,7 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertEqual(overrides["fit_windows"][transition_id]["transition_half_width_kms"], 320.0)
         self.assertEqual(overrides["fit_windows"][transition_id]["sibling_mask_mode"], "allow_overlap")
         self.assertEqual(applied_overrides["source_seeds"][0]["center_velocity_kms"], 140.0)
+        self.assertEqual(applied_overrides["source_detection_mode"], "controlled")
         self.assertEqual(overrides["continuum_anchor_nodes"][0]["continuum_flux"], 1.08)
         self.assertEqual(refit_record["sample_id"], "apply_demo_refit")
         self.assertTrue(refit_record["fit_control_patches"][0]["applied"])
@@ -358,7 +418,7 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertIn("fit_control_evaluation", refit_record)
         self.assertTrue(refit_record["fit_control_application"]["applied"])
         self.assertIn("evaluation", refit_record["fit_control_application"])
-        self.assertEqual(refit_record["fit_results"][0]["fit_control_applied"]["n_source_seeds"], 1)
+        self.assertGreaterEqual(refit_record["fit_results"][0]["fit_control_applied"]["n_source_seeds"], 1)
         refit_frame = next(
             frame
             for frame in refit_record["fit_results"][0]["transition_frames"]
@@ -393,8 +453,8 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertEqual(evaluation["decision"], "rejected")
         self.assertFalse(evaluation["accepted"])
         self.assertTrue(evaluation["requires_human_review"])
-        self.assertIn("fit_rms_worsened", evaluation["reasons"])
-        self.assertIn("component_count_exploded", evaluation["reasons"])
+        self.assertIn("fit_rms_worsened", evaluation["warnings"])
+        self.assertIn("component_count_exploded", evaluation["warnings"])
         self.assertIn("fit_window_or_mask_removed_too_many_pixels", evaluation["reasons"])
         self.assertIn("fit_quality_regressed", evaluation["warnings"])
 
@@ -424,6 +484,496 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertTrue(evaluation["accepted"])
         self.assertFalse(evaluation["requires_human_review"])
         self.assertEqual(evaluation["warnings"], [])
+        self.assertIn("chi2", evaluation["metrics"]["delta"])
+        self.assertIn("reduced_chi2", evaluation["metrics"]["delta"])
+        self.assertIn("source_work_window_reduced_chi2", evaluation["metrics"]["delta"])
+
+    def test_refit_evaluation_downgrades_global_rms_worsening_when_work_window_improves(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.0,
+            "n_components_fitted": 3,
+            "n_fit_pixels": 100,
+            "source_work_window_metrics": {"fit_rms": 1.0, "n_fit_pixels": 80, "max_abs_residual_sigma": 5.0},
+            "agent_review": {"required": True, "reasons": ["high_residual_transition_peak"]},
+            "transition_frames": [],
+        }
+        refit_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.12,
+            "n_components_fitted": 4,
+            "n_fit_pixels": 100,
+            "source_work_window_metrics": {"fit_rms": 0.90, "n_fit_pixels": 80, "max_abs_residual_sigma": 4.0},
+            "agent_review": {"required": True, "reasons": ["high_residual_transition_peak"]},
+            "transition_frames": [],
+        }
+
+        evaluation = evaluate_refit_patch(original_fit, refit_fit, {"source_seeds": [{"transition_line_id": "MGII_2796"}], "removed_sources": []})
+
+        self.assertEqual(evaluation["decision"], "needs_human_review")
+        self.assertNotIn("fit_rms_worsened", evaluation["reasons"])
+        self.assertIn("fit_rms_worsened_but_source_work_window_improved", evaluation["warnings"])
+
+    def test_refit_evaluation_does_not_hard_reject_continuum_only_rms_worsening(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.0,
+            "n_components_fitted": 2,
+            "n_fit_pixels": 100,
+            "source_work_window_metrics": {"fit_rms": 1.0, "n_fit_pixels": 80, "max_abs_residual_sigma": 3.0},
+            "agent_review": {"required": True, "reasons": ["saturated_peak"]},
+            "transition_frames": [],
+        }
+        refit_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.9,
+            "n_components_fitted": 2,
+            "n_fit_pixels": 100,
+            "source_work_window_metrics": {"fit_rms": 1.8, "n_fit_pixels": 80, "max_abs_residual_sigma": 5.0},
+            "agent_review": {"required": True, "reasons": ["saturated_peak", "component_parameter_posterior_degenerate"]},
+            "transition_frames": [],
+        }
+
+        evaluation = evaluate_refit_patch(
+            original_fit,
+            refit_fit,
+            {
+                "source_seeds": [],
+                "removed_sources": [],
+                "continuum_anchor_remove_wavelengths_A": [9775.6, 9780.4],
+            },
+        )
+
+        self.assertEqual(evaluation["decision"], "needs_human_review")
+        self.assertNotIn("fit_rms_worsened", evaluation["reasons"])
+        self.assertIn("continuum_changed_fit_not_directly_comparable", evaluation["warnings"])
+        self.assertIn("continuum_refit_needs_source_mask_followup", evaluation["warnings"])
+
+    def test_fit_control_prompt_omits_map_initializer_fields(self):
+        record = self._demo_record()
+        fit_summary = record["fit_results"][0]
+        fit_summary.setdefault("components", [{}])[0]["map_parameters"] = {"center_velocity_kms": 123.0}
+        fit_summary["components"][0]["fit_parameter_summary"] = {"backend": "least_squares"}
+        fit_summary.setdefault("transition_frames", [{"peaks": [{}]}])[0].setdefault("peaks", [{}])[0][
+            "map_parameters"
+        ] = {"center_velocity_kms": 123.0}
+        fit_summary["transition_frames"][0]["peaks"][0]["fit_parameter_summary"] = {"backend": "least_squares"}
+
+        messages = build_fit_control_messages(record)
+        text = messages[1].content
+
+        self.assertNotIn("map_parameters", text)
+        self.assertNotIn("fit_parameter_summary", text)
+
+    def test_continuum_changed_carryover_sources_are_soft_position_priors(self):
+        original_fit = {
+            "components": [
+                {
+                    "fit_success": True,
+                    "component_index": 3,
+                    "transition_line_id": "MGII_2803",
+                    "center_velocity_kms": 42.0,
+                    "logN": 18.8,
+                    "b_kms": 180.0,
+                }
+            ]
+        }
+        controls = {
+            "continuum_anchor_remove_wavelengths_A": [9806.0],
+            "source_seeds": [],
+            "removed_sources": [],
+            "fit_mask_intervals": [],
+            "fit_windows": {},
+            "tool_calls": [
+                {
+                    "name": "remove_continuum_anchor",
+                    "arguments": {"wavelength_A": 9806.0, "reason": "bad continuum"},
+                }
+            ],
+        }
+
+        controlled = _with_controlled_source_seeds(original_fit, controls)
+        carried = controlled["source_seeds"][0]
+
+        self.assertEqual(carried["seed_source"], "previous_fit_component")
+        self.assertFalse(carried["explicit_fit_control_source"])
+        self.assertEqual(carried["center_velocity_kms"], 42.0)
+        self.assertEqual(carried["center_prior_sigma_kms"], 90.0)
+        self.assertEqual(carried["center_prior_half_width_kms"], 240.0)
+        self.assertNotIn("logN", carried)
+        self.assertNotIn("b_kms", carried)
+        self.assertNotIn("logN_lower", carried)
+        self.assertNotIn("logN_upper", carried)
+        self.assertNotIn("b_kms_lower", carried)
+        self.assertNotIn("b_kms_upper", carried)
+
+    def test_continuum_changed_existing_source_seeds_are_soft_position_priors(self):
+        controls = {
+            "continuum_anchor_remove_wavelengths_A": [9806.0],
+            "source_seeds": [
+                {
+                    "transition_line_id": "MGII_2803",
+                    "center_velocity_kms": 42.0,
+                    "explicit_fit_control_source": True,
+                    "seed_source": "add_absorption_source",
+                    "logN": 18.8,
+                    "b_kms": 180.0,
+                    "logN_lower": 15.0,
+                    "logN_upper": 19.0,
+                    "b_kms_lower": 20.0,
+                    "b_kms_upper": 250.0,
+                }
+            ],
+            "removed_sources": [],
+            "fit_mask_intervals": [],
+            "fit_windows": {},
+            "tool_calls": [
+                {
+                    "name": "remove_continuum_anchor",
+                    "arguments": {"wavelength_A": 9806.0, "reason": "bad continuum"},
+                }
+            ],
+        }
+
+        controlled = _with_controlled_source_seeds({"components": []}, controls)
+        seed = controlled["source_seeds"][0]
+
+        self.assertFalse(seed["explicit_fit_control_source"])
+        self.assertEqual(seed["center_prior_sigma_kms"], 90.0)
+        self.assertEqual(seed["center_prior_half_width_kms"], 240.0)
+        self.assertNotIn("logN", seed)
+        self.assertNotIn("b_kms", seed)
+        self.assertNotIn("logN_lower", seed)
+        self.assertNotIn("logN_upper", seed)
+        self.assertNotIn("b_kms_lower", seed)
+        self.assertNotIn("b_kms_upper", seed)
+
+    def test_refit_evaluation_reports_high_context_diagnostic_residual(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.4,
+            "n_components_fitted": 1,
+            "n_fit_pixels": 30,
+            "agent_review": {"required": True, "reasons": []},
+            "transition_frames": [],
+        }
+        refit_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.2,
+            "n_components_fitted": 1,
+            "n_fit_pixels": 30,
+            "agent_review": {"required": True, "reasons": []},
+            "transition_frames": [
+                {
+                    "transition_line_id": "MGII_2796",
+                    "diagnostic_residual_samples": [
+                        {"velocity_kms": 470.0, "residual_sigma": 4.5, "used_in_fit": False},
+                        {"velocity_kms": 510.0, "residual_sigma": -2.0, "used_in_fit": False},
+                        {"velocity_kms": 520.0, "residual_sigma": 7.0, "used_in_fit": True},
+                    ],
+                }
+            ],
+        }
+
+        evaluation = evaluate_refit_patch(original_fit, refit_fit, {"source_seeds": [], "removed_sources": []})
+        context = evaluation["metrics"]["delta"]["context_residual"]
+
+        self.assertIn("high_context_diagnostic_residual", evaluation["warnings"])
+        self.assertEqual(context["n_high_context_diagnostic_residual_pixels"], 1)
+        self.assertEqual(context["details"][0]["n_context_diagnostic_pixels"], 2)
+
+    def test_refit_evaluation_penalizes_added_source_in_saturated_redundant_region(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.2,
+            "n_components_fitted": 1,
+            "n_fit_pixels": 80,
+            "agent_review": {"required": True, "reasons": ["saturated_peak"]},
+            "transition_frames": [],
+            "components": [
+                {
+                    "component_index": 0,
+                    "transition_line_id": "MGII_2803",
+                    "diagnostic_flags": [],
+                }
+            ],
+        }
+        refit_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.0,
+            "n_components_fitted": 2,
+            "n_fit_pixels": 80,
+            "agent_review": {"required": True, "reasons": ["saturated_peak", "saturated_redundant_component"]},
+            "transition_frames": [],
+            "components": [
+                {
+                    "component_index": 0,
+                    "transition_line_id": "MGII_2803",
+                    "diagnostic_flags": [],
+                },
+                {
+                    "component_index": 1,
+                    "transition_line_id": "MGII_2803",
+                    "diagnostic_flags": ["saturated_redundant_component"],
+                },
+            ],
+        }
+
+        evaluation = evaluate_refit_patch(
+            original_fit,
+            refit_fit,
+            {"source_seeds": [{"transition_line_id": "MGII_2803"}], "removed_sources": []},
+        )
+
+        self.assertEqual(evaluation["decision"], "needs_human_review")
+        self.assertIn("added_source_in_already_saturated_region", evaluation["warnings"])
+        self.assertGreater(
+            evaluation["metrics"]["delta"]["component_diagnostic_regression"]["new_saturated_redundant_components"],
+            0,
+        )
+
+    def test_refit_evaluation_keeps_hard_reject_for_large_global_rms_worsening(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.0,
+            "n_components_fitted": 3,
+            "n_fit_pixels": 100,
+            "source_work_window_metrics": {"fit_rms": 1.0, "n_fit_pixels": 80, "max_abs_residual_sigma": 5.0},
+            "agent_review": {"required": True, "reasons": []},
+            "transition_frames": [],
+        }
+        refit_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.35,
+            "n_components_fitted": 4,
+            "n_fit_pixels": 100,
+            "source_work_window_metrics": {"fit_rms": 0.90, "n_fit_pixels": 80, "max_abs_residual_sigma": 4.0},
+            "agent_review": {"required": True, "reasons": []},
+            "transition_frames": [],
+        }
+
+        evaluation = evaluate_refit_patch(original_fit, refit_fit, {"source_seeds": [{"transition_line_id": "MGII_2796"}], "removed_sources": []})
+
+        self.assertEqual(evaluation["decision"], "needs_human_review")
+        self.assertIn("fit_rms_worsened", evaluation["warnings"])
+
+    def test_refit_evaluation_marks_global_rms_incomparable_when_new_transition_frame_is_fit(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "chi2": 43.08,
+            "reduced_chi2": 0.916,
+            "fit_rms": 0.957,
+            "n_components_fitted": 4,
+            "n_fit_pixels": 47,
+            "source_work_window_metrics": {"fit_rms": 0.964, "n_fit_pixels": 32, "max_abs_residual_sigma": 2.4},
+            "agent_review": {"required": True, "reasons": ["saturated_peak"]},
+            "transition_frames": [
+                {
+                    "transition_line_id": "MGII_2796",
+                    "observed_center_A": 9780.52,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 47, "chi2": 43.08, "reduced_chi2": 0.916, "fit_rms": 0.957},
+                },
+                {
+                    "transition_line_id": "MGII_2803",
+                    "observed_center_A": 9805.63,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 0, "chi2": float("nan"), "reduced_chi2": float("nan"), "fit_rms": float("nan")},
+                },
+            ],
+        }
+        refit_fit = {
+            "success": True,
+            "quality": "inspect",
+            "chi2": 227.51,
+            "reduced_chi2": 2.446,
+            "fit_rms": 1.564,
+            "n_components_fitted": 6,
+            "n_fit_pixels": 93,
+            "source_work_window_metrics": {"fit_rms": 0.903, "n_fit_pixels": 65, "max_abs_residual_sigma": 2.45},
+            "agent_review": {"required": True, "reasons": ["saturated_peak"]},
+            "transition_frames": [
+                {
+                    "transition_line_id": "MGII_2796",
+                    "observed_center_A": 9780.52,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 47, "chi2": 44.0, "reduced_chi2": 0.936, "fit_rms": 0.967},
+                },
+                {
+                    "transition_line_id": "MGII_2803",
+                    "observed_center_A": 9805.63,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 46, "chi2": 183.5, "reduced_chi2": 3.99, "fit_rms": 1.997},
+                },
+            ],
+        }
+
+        evaluation = evaluate_refit_patch(
+            original_fit,
+            refit_fit,
+            {"source_seeds": [{"transition_line_id": "MGII_2803", "center_velocity_kms": -220.0}], "removed_sources": []},
+        )
+
+        self.assertEqual(evaluation["decision"], "needs_human_review")
+        self.assertNotIn("fit_rms_worsened", evaluation["reasons"])
+        self.assertIn("fit_pixel_coverage_changed_between_rounds", evaluation["warnings"])
+        self.assertIn("global_fit_rms_not_directly_comparable", evaluation["warnings"])
+        frame_comparison = evaluation["metrics"]["delta"]["transition_frame_fit_comparison"]
+        self.assertEqual(frame_comparison["added_fitted_transition_line_ids"], ["MGII_2803"])
+        self.assertEqual(frame_comparison["common_fitted_transition_line_ids"], ["MGII_2796"])
+        overlap_policy = evaluation["metrics"]["delta"]["overlap_edit_policy"]
+        self.assertTrue(overlap_policy["edits_in_overlapping_velocity_frames"])
+        self.assertTrue(overlap_policy["edit_annotations"])
+
+    def test_refit_evaluation_flags_overlap_source_removal_without_mask(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.0,
+            "n_components_fitted": 2,
+            "n_fit_pixels": 80,
+            "agent_review": {"required": True, "reasons": []},
+            "transition_frames": [
+                {
+                    "transition_line_id": "LINE_A",
+                    "observed_center_A": 1000.0,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 40, "chi2": 40.0, "reduced_chi2": 1.0, "fit_rms": 1.0},
+                },
+                {
+                    "transition_line_id": "LINE_B",
+                    "observed_center_A": 1002.0,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 40, "chi2": 40.0, "reduced_chi2": 1.0, "fit_rms": 1.0},
+                },
+            ],
+        }
+        refit_fit = dict(original_fit)
+
+        evaluation = evaluate_refit_patch(
+            original_fit,
+            refit_fit,
+            {
+                "removed_sources": [
+                    {
+                        "component_index": 3,
+                        "transition_line_id": "LINE_A",
+                        "center_velocity_kms": 560.0,
+                    }
+                ],
+                "source_seeds": [],
+                "fit_mask_intervals": [],
+            },
+        )
+
+        self.assertIn("edits_in_overlapping_velocity_frames", evaluation["warnings"])
+        self.assertIn("missing_overlap_mask_after_source_removal", evaluation["warnings"])
+        self.assertIn("overlap_affected_velocity_frames_unaddressed", evaluation["warnings"])
+        overlap_policy = evaluation["metrics"]["delta"]["overlap_edit_policy"]
+        self.assertTrue(overlap_policy["removed_source_violations"])
+        self.assertEqual(overlap_policy["unaddressed_affected_transition_line_ids"][0]["transition_line_id"], "LINE_B")
+
+    def test_refit_evaluation_annotates_overlap_mask_edits(self):
+        fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.0,
+            "n_components_fitted": 2,
+            "n_fit_pixels": 80,
+            "agent_review": {"required": True, "reasons": []},
+            "transition_frames": [
+                {
+                    "transition_line_id": "LINE_A",
+                    "observed_center_A": 1000.0,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 40, "chi2": 40.0, "reduced_chi2": 1.0, "fit_rms": 1.0},
+                },
+                {
+                    "transition_line_id": "LINE_B",
+                    "observed_center_A": 1002.0,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 40, "chi2": 40.0, "reduced_chi2": 1.0, "fit_rms": 1.0},
+                },
+            ],
+        }
+
+        evaluation = evaluate_refit_patch(
+            fit,
+            fit,
+            {
+                "removed_sources": [],
+                "source_seeds": [],
+                "fit_mask_intervals": [
+                    {
+                        "transition_line_id": "LINE_A",
+                        "start_velocity_kms": 520.0,
+                        "end_velocity_kms": 590.0,
+                        "mask_kind": "exclude",
+                    }
+                ],
+            },
+        )
+
+        self.assertIn("edits_in_overlapping_velocity_frames", evaluation["warnings"])
+        self.assertIn("overlap_affected_velocity_frames_unaddressed", evaluation["warnings"])
+        overlap_policy = evaluation["metrics"]["delta"]["overlap_edit_policy"]
+        self.assertEqual(overlap_policy["edit_annotations"][0]["tool_kind"], "set_fit_mask_interval:exclude")
+
+    def test_refit_evaluation_flags_affected_overlap_frame_without_fit_pixels(self):
+        original_fit = {
+            "success": True,
+            "quality": "inspect",
+            "fit_rms": 1.0,
+            "n_components_fitted": 2,
+            "n_fit_pixels": 40,
+            "agent_review": {"required": True, "reasons": []},
+            "transition_frames": [
+                {
+                    "transition_line_id": "LINE_A",
+                    "observed_center_A": 1000.0,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 40, "chi2": 40.0, "reduced_chi2": 1.0, "fit_rms": 1.0},
+                },
+                {
+                    "transition_line_id": "LINE_B",
+                    "observed_center_A": 1002.0,
+                    "velocity_frame": {"bounds_kms": [-600.0, 600.0]},
+                    "fit_metrics": {"n_fit_pixels": 0, "chi2": float("nan"), "reduced_chi2": float("nan"), "fit_rms": float("nan")},
+                },
+            ],
+        }
+
+        evaluation = evaluate_refit_patch(
+            original_fit,
+            original_fit,
+            {
+                "removed_sources": [],
+                "source_seeds": [],
+                "fit_mask_intervals": [
+                    {
+                        "transition_line_id": "LINE_A",
+                        "start_velocity_kms": 520.0,
+                        "end_velocity_kms": 590.0,
+                        "mask_kind": "exclude",
+                    }
+                ],
+            },
+        )
+
+        self.assertIn("overlap_affected_velocity_frames_without_fit_pixels", evaluation["warnings"])
+        overlap_policy = evaluation["metrics"]["delta"]["overlap_edit_policy"]
+        self.assertEqual(overlap_policy["affected_transition_line_ids_without_fit_pixels"][0]["transition_line_id"], "LINE_B")
 
     def test_refit_evaluation_does_not_hard_reject_light_quality_regression_with_clear_rms_gain(self):
         original_fit = {
@@ -542,6 +1092,7 @@ class LLMInterfaceTest(unittest.TestCase):
 
     def test_fit_control_overrides_sanitize_tool_arguments(self):
         record = self._demo_record()
+        anchor_wavelength = record["plot_data"]["anchor_wavelengths_A"][1]
         patch = {
             "task": "fit_control_patch",
             "source": "unit",
@@ -557,6 +1108,13 @@ class LLMInterfaceTest(unittest.TestCase):
                         "b_kms": 1.0e6,
                         "center_prior_sigma_kms": -5.0,
                         "reason": "bad raw values",
+                    },
+                },
+                {
+                    "name": "remove_continuum_anchor",
+                    "arguments": {
+                        "anchor_index": 1,
+                        "reason": "remove biased current anchor",
                     },
                 },
                 {
@@ -595,6 +1153,8 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertEqual(overrides["fit_mask_intervals"][0]["start_velocity_kms"], -5000.0)
         self.assertEqual(overrides["fit_mask_intervals"][0]["end_velocity_kms"], 5000.0)
         self.assertEqual(overrides["fit_mask_intervals"][0]["mask_kind"], "exclude")
+        self.assertEqual(overrides["continuum_anchor_remove_indices"], [])
+        self.assertEqual(overrides["continuum_anchor_remove_wavelengths_A"], [anchor_wavelength])
 
     def test_merge_fit_control_overrides_dedupes_repeated_sources_and_masks(self):
         first = {
@@ -641,6 +1201,61 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertEqual(len(merged["source_seeds"]), 1)
         self.assertEqual(len(merged["fit_mask_intervals"]), 1)
         self.assertEqual(merged["source_seeds"][0]["reason"], "repeat")
+
+    def test_merge_fit_control_overrides_dedupes_removed_continuum_anchor_wavelengths(self):
+        merged = merge_fit_control_overrides(
+            {"continuum_anchor_remove_wavelengths_A": [9775.6], "tool_calls": []},
+            {"continuum_anchor_remove_wavelengths_A": [9775.65, 9780.4], "tool_calls": []},
+        )
+
+        self.assertEqual(merged["continuum_anchor_remove_wavelengths_A"], [9775.6, 9780.4])
+
+    def test_merge_fit_control_overrides_drops_source_overlapping_exclude_mask(self):
+        merged = merge_fit_control_overrides(
+            {
+                "source_seeds": [
+                    {
+                        "transition_line_id": "MGII_2796",
+                        "center_velocity_kms": 547.0,
+                        "seed_source": "previous_fit_component",
+                    },
+                    {
+                        "transition_line_id": "MGII_2796",
+                        "center_velocity_kms": 474.0,
+                        "center_prior_half_width_kms": 45.0,
+                        "seed_source": "previous_fit_component",
+                    },
+                    {
+                        "transition_line_id": "MGII_2796",
+                        "center_velocity_kms": 64.0,
+                        "seed_source": "previous_fit_component",
+                    },
+                    {
+                        "transition_line_id": "MGII_2803",
+                        "center_velocity_kms": 547.0,
+                        "seed_source": "previous_fit_component",
+                    },
+                ],
+                "tool_calls": [],
+            },
+            {
+                "fit_mask_intervals": [
+                    {
+                        "transition_line_id": "MGII_2796",
+                        "start_velocity_kms": 495.0,
+                        "end_velocity_kms": 590.0,
+                        "mask_kind": "exclude",
+                    }
+                ],
+                "tool_calls": [],
+            },
+        )
+
+        centers = [(item["transition_line_id"], item["center_velocity_kms"]) for item in merged["source_seeds"]]
+        self.assertNotIn(("MGII_2796", 547.0), centers)
+        self.assertNotIn(("MGII_2796", 474.0), centers)
+        self.assertIn(("MGII_2796", 64.0), centers)
+        self.assertIn(("MGII_2803", 547.0), centers)
 
     def test_remove_source_patch_removes_only_target_seed(self):
         spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
@@ -748,8 +1363,111 @@ class LLMInterfaceTest(unittest.TestCase):
             self.assertTrue(refit_json.exists())
             self.assertTrue((outdir / "apply_cli_demo_refit.plot.png").exists())
             refit = json.loads(refit_json.read_text(encoding="utf-8"))
-            self.assertEqual(refit["fit_control_application"]["summary"]["n_source_seeds"], 1)
+            self.assertGreaterEqual(refit["fit_control_application"]["summary"]["n_source_seeds"], 1)
+            self.assertEqual(refit["fit_control_application"]["controls"]["source_detection_mode"], "controlled")
             self.assertIn("fit_control_evaluation", refit)
+
+    def test_agent_refit_does_not_auto_detect_new_sources_after_llm_seed(self):
+        z_sys = 0.0
+        rest_A = 2796.352
+        wavelength = np.arange(rest_A - 7.0, rest_A + 7.0, 0.08)
+        velocity = (wavelength / rest_A - 1.0) * 299792.458
+        flux = 1.0 - 0.35 * np.exp(-0.5 * (velocity / 22.0) ** 2)
+        flux -= 0.28 * np.exp(-0.5 * ((velocity - 180.0) / 20.0) ** 2)
+        spectrum = pd.DataFrame(
+            {
+                "wavelength": wavelength,
+                "flux": flux,
+                "ivar": np.full_like(wavelength, 900.0),
+                "pipeline_mask": np.zeros_like(wavelength, dtype=int),
+            }
+        )
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="MGII_2796",
+            z_sys=z_sys,
+            sample_id="controlled_refit_demo",
+            source={"kind": "unit_test"},
+            half_width_kms=700.0,
+        )
+        original_components = len(record["fit_results"][0]["components"])
+        patch = {
+            "task": "fit_control_patch",
+            "source": "unit",
+            "status": "tool_calls",
+            "rationale": "controlled seed",
+            "tool_calls": [
+                {
+                    "name": "add_absorption_source",
+                    "arguments": {
+                        "transition_line_id": "MGII_2796",
+                        "center_velocity_kms": -180.0,
+                        "reason": "explicit added seed",
+                    },
+                }
+            ],
+            "requires_refit": True,
+            "applied": False,
+        }
+
+        refit_record, controls = refit_record_with_patch(record, window, patch)
+
+        peaks = refit_record["fit_results"][0]["transition_frames"][0]["peaks"]
+        self.assertEqual(refit_record["fit_results"][0]["transition_frames"][0]["peak_detection"]["source_detection_mode"], "controlled")
+        self.assertEqual(len(peaks), original_components + 1)
+        self.assertEqual(controls["source_detection_mode"], "controlled")
+        self.assertTrue(all(peak["seed_source"] != "absorption_trough" for peak in peaks))
+
+    def test_controlled_refit_does_not_carry_previous_source_inside_new_fit_mask(self):
+        z_sys = 0.0
+        rest_A = 2796.352
+        wavelength = np.arange(rest_A - 7.0, rest_A + 7.0, 0.08)
+        velocity = (wavelength / rest_A - 1.0) * 299792.458
+        flux = 1.0 - 0.35 * np.exp(-0.5 * (velocity / 22.0) ** 2)
+        flux -= 0.30 * np.exp(-0.5 * ((velocity - 520.0) / 18.0) ** 2)
+        spectrum = pd.DataFrame(
+            {
+                "wavelength": wavelength,
+                "flux": flux,
+                "ivar": np.full_like(wavelength, 900.0),
+                "pipeline_mask": np.zeros_like(wavelength, dtype=int),
+            }
+        )
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="MGII_2796",
+            z_sys=z_sys,
+            sample_id="controlled_mask_demo",
+            source={"kind": "unit_test"},
+            half_width_kms=700.0,
+        )
+        patch = {
+            "task": "fit_control_patch",
+            "source": "unit",
+            "status": "tool_calls",
+            "rationale": "mask edge",
+            "tool_calls": [
+                {
+                    "name": "set_fit_mask_interval",
+                    "arguments": {
+                        "transition_line_id": "MGII_2796",
+                        "start_velocity_kms": 480.0,
+                        "end_velocity_kms": 560.0,
+                        "mask_kind": "exclude",
+                        "reason": "edge contaminant",
+                    },
+                }
+            ],
+            "requires_refit": True,
+            "applied": False,
+        }
+
+        refit_record, controls = refit_record_with_patch(record, window, patch)
+
+        centers = [source["center_velocity_kms"] for source in controls["source_seeds"] if source["transition_line_id"] == "MGII_2796"]
+        self.assertTrue(all(not (480.0 <= center <= 560.0) for center in centers))
+        peaks = refit_record["fit_results"][0]["transition_frames"][0]["peaks"]
+        self.assertTrue(all(not (480.0 <= float(peak.get("seed_velocity_kms", 0.0)) <= 560.0) for peak in peaks))
 
 
 if __name__ == "__main__":

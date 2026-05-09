@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +11,12 @@ import pandas as pd
 from astroagent.agent.policy import SOURCE_WORK_WINDOW_KMS
 from astroagent.review.continuum import C_KMS, _contiguous_intervals, velocity_kms
 from astroagent.spectra.voigt_model import physical_component_flux_model
+
+
+def _configure_matplotlib_cache() -> None:
+    cache_dir = Path(tempfile.gettempdir()) / "astroagent-matplotlib"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(cache_dir))
 
 
 def _smooth_voigt_curve(
@@ -159,6 +167,15 @@ def _component_posterior_band(
     *,
     n_samples: int = 128,
 ) -> np.ndarray | None:
+    if component.get("fit_backend") != "ultranest":
+        return None
+    if component.get("parameter_estimator") != "posterior_median":
+        return None
+    if set(component.get("diagnostic_flags", [])) & {
+        "component_parameter_posterior_degenerate",
+        "component_parameter_posterior_disagrees_with_map",
+    }:
+        return None
     intervals = component.get("parameter_intervals", {})
     logN_i = intervals.get("logN", {})
     b_i = intervals.get("b_kms", {})
@@ -208,6 +225,12 @@ def _combined_posterior_band(
         component
         for component in components
         if component.get("fit_success") and str(component.get("transition_line_id")) == transition_line_id
+        and component.get("fit_backend") == "ultranest"
+        and component.get("parameter_estimator") == "posterior_median"
+        and not (
+            set(component.get("diagnostic_flags", []))
+            & {"component_parameter_posterior_degenerate", "component_parameter_posterior_disagrees_with_map"}
+        )
     ]
     if not transition_components:
         return None
@@ -233,15 +256,11 @@ def save_review_plot(
     plot_summary: dict[str, Any] | None = None,
     fit_summary: dict[str, Any] | None = None,
 ) -> Path:
-    import os
-
     if plot_window is None or plot_summary is None or fit_summary is None:
         raise ValueError("save_review_plot requires precomputed plot_window, plot_summary, and fit_summary")
 
     plot_path = Path(output_path)
-    mpl_config_dir = plot_path.parent / ".matplotlib"
-    mpl_config_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
+    _configure_matplotlib_cache()
 
     import matplotlib
 
@@ -265,6 +284,7 @@ def save_review_plot(
     transitions = record.get("input", {}).get("transitions", [])
     if not transitions:
         transitions = list(frame_by_id.values())
+    has_frame_residual_schema = any("residual_samples" in frame for frame in frame_by_id.values())
     n_panels = max(1, len(transitions))
     fig_height = max(4.0, 3.25 * n_panels + 0.8)
     height_ratios = [2.7, 1.0] * n_panels
@@ -284,16 +304,15 @@ def save_review_plot(
     excluded_color = "#d97706"
     fit_mask_color = "#7c3aed"
     fit_mask_intervals = _fit_mask_intervals_by_transition(record, fit_summary)
-
-    residual_sigma = (
+    legacy_residual_sigma = (
         plot_window["voigt_residual_sigma"].to_numpy(dtype=float)
         if "voigt_residual_sigma" in plot_window.columns
         else np.full(len(plot_window), np.nan, dtype=float)
     )
-    fit_pixel = (
+    legacy_fit_pixel = (
         plot_window["is_voigt_fit_pixel"].to_numpy(dtype=bool)
         if "is_voigt_fit_pixel" in plot_window.columns
-        else np.isfinite(residual_sigma)
+        else np.isfinite(legacy_residual_sigma)
     )
 
     flux_axes: list[Any] = []
@@ -319,8 +338,13 @@ def save_review_plot(
         f_panel = normalized_flux[panel_mask][order]
         err_panel = normalized_err[panel_mask][order]
         good_panel = good[panel_mask][order]
-        residual_panel = residual_sigma[panel_mask][order]
-        fit_panel = fit_pixel[panel_mask][order]
+        residual_velocity, residual_panel = _frame_residual_series(frame)
+        masked_residual_velocity, masked_residual_panel = _frame_diagnostic_masked_residual_series(frame)
+        if len(residual_velocity) == 0 and not has_frame_residual_schema:
+            legacy_residual_panel = legacy_residual_sigma[panel_mask][order]
+            legacy_fit_panel = legacy_fit_pixel[panel_mask][order] & np.isfinite(legacy_residual_panel)
+            residual_velocity = v_panel[legacy_fit_panel]
+            residual_panel = legacy_residual_panel[legacy_fit_panel]
 
         if len(v_panel) == 0:
             axis.text(0.5, 0.5, f"{transition_line_id}: no pixels in velocity frame", ha="center", va="center")
@@ -415,11 +439,21 @@ def save_review_plot(
         residual_axis.axhline(0.0, color="0.25", linewidth=0.8)
         residual_axis.axhline(3.0, color="#c1121f", linewidth=0.7, linestyle="--", alpha=0.65)
         residual_axis.axhline(-3.0, color="#c1121f", linewidth=0.7, linestyle="--", alpha=0.65)
-        residual_axis.step(v_panel, residual_panel, where="mid", color="#334155", linewidth=0.95, label="residual sigma")
-        significant = fit_panel & np.isfinite(residual_panel) & (np.abs(residual_panel) >= 3.0)
+        residual_axis.step(residual_velocity, residual_panel, where="mid", color="#334155", linewidth=0.95, label="residual sigma")
+        if len(masked_residual_velocity):
+            residual_axis.scatter(
+                masked_residual_velocity,
+                masked_residual_panel,
+                s=10,
+                color="#7c3aed",
+                alpha=0.55,
+                zorder=3,
+                label="masked residual",
+            )
+        significant = np.isfinite(residual_panel) & (np.abs(residual_panel) >= 3.0)
         if significant.any():
             residual_axis.scatter(
-                v_panel[significant],
+                residual_velocity[significant],
                 residual_panel[significant],
                 s=12,
                 color="#c1121f",
@@ -429,7 +463,12 @@ def save_review_plot(
         residual_axis.axvline(0.0, color="0.55", linewidth=0.8, linestyle=":")
         residual_axis.set_ylabel("Resid.\nsigma")
         residual_axis.grid(alpha=0.18)
-        finite_residual = residual_panel[np.isfinite(residual_panel) & fit_panel]
+        finite_residual = np.concatenate(
+            [
+                residual_panel[np.isfinite(residual_panel)],
+                masked_residual_panel[np.isfinite(masked_residual_panel)],
+            ]
+        )
         if len(finite_residual):
             lo, hi = np.nanpercentile(finite_residual, [2.0, 98.0])
             bound = max(4.0, min(25.0, float(max(abs(lo), abs(hi))) + 1.0))
@@ -495,6 +534,38 @@ def _fit_mask_intervals_by_transition(record: dict[str, Any], fit_summary: dict[
     return intervals
 
 
+def _frame_residual_series(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    samples = frame.get("residual_samples", [])
+    if not isinstance(samples, list) or not samples:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    rows = [
+        (float(sample.get("velocity_kms")), float(sample.get("residual_sigma")))
+        for sample in samples
+        if _finite_float(sample.get("velocity_kms")) is not None and _finite_float(sample.get("residual_sigma")) is not None
+    ]
+    if not rows:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    rows.sort(key=lambda item: item[0])
+    return np.asarray([item[0] for item in rows], dtype=float), np.asarray([item[1] for item in rows], dtype=float)
+
+
+def _frame_diagnostic_masked_residual_series(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    samples = frame.get("diagnostic_residual_samples", [])
+    if not isinstance(samples, list) or not samples:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    rows = [
+        (float(sample.get("velocity_kms")), float(sample.get("residual_sigma")))
+        for sample in samples
+        if sample.get("used_in_fit") is False
+        and _finite_float(sample.get("velocity_kms")) is not None
+        and _finite_float(sample.get("residual_sigma")) is not None
+    ]
+    if not rows:
+        return np.asarray([], dtype=float), np.asarray([], dtype=float)
+    rows.sort(key=lambda item: item[0])
+    return np.asarray([item[0] for item in rows], dtype=float), np.asarray([item[1] for item in rows], dtype=float)
+
+
 def _draw_fit_mask_intervals(axis: Any, residual_axis: Any, intervals: list[dict[str, Any]], color: str) -> None:
     for index, interval in enumerate(intervals):
         start = float(interval["start_velocity_kms"])
@@ -531,12 +602,8 @@ def save_window_overview_plot(
     plot_window: pd.DataFrame,
 ) -> Path:
     """Save wavelength-space context for the same local review window."""
-    import os
-
     plot_path = Path(output_path)
-    mpl_config_dir = plot_path.parent / ".matplotlib"
-    mpl_config_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
+    _configure_matplotlib_cache()
 
     import matplotlib
 
