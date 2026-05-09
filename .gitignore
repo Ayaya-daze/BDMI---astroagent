@@ -29,6 +29,7 @@ models/**
 runs/**
 wandb/**
 Egent/
+reports/fit_control_real_model_report/
 
 # Keep directory placeholders
 !data/**/.gitkeep

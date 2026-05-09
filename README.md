@@ -135,3 +135,4 @@ loop 不是单次 LLM 调用。每轮会把上一轮已经接受或保留的 ove
 - 更高层科学解释必须保留人工裁决。
 - 当前代码先保证中间产物可审查，再扩展到 DESI、teacher labels、SFT 和 RL。
 - `outputs/` 里的实验产物默认可清理，不作为长期结果或数据集版本管理位置。
+- `reports/fit_control_real_model_report/` 是本地技术报告工作区，包含 PDF、图片和真实模型验证摘要副本；默认 ignore，不作为代码仓库资产提交。
