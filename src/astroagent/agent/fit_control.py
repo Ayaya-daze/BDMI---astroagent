@@ -18,6 +18,7 @@ FIT_CONTROL_TOOL_NAMES = {
     "set_fit_mask_interval",
     "set_fit_window",
     "request_refit",
+    "request_more_budget",
     "add_continuum_anchor",
     "remove_continuum_anchor",
     "update_continuum_mask",

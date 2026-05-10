@@ -125,10 +125,12 @@ outputs/review_packet/demo_CIV_doublet_z2p6000.fit_control_patch.json
 .venv/bin/python -m astroagent.cli.main fit-loop \
   --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
   --client offline \
-  --max-rounds 3
+  --max-rounds 2 \
+  --hard-max-rounds 6
 ```
 
 这些统一入口会从 `sample_id` 自动推断同目录的 `*.window.csv`、`*.overview.png` 和 `*.plot.png`；旧的 `scripts/*.py` 包装入口仍然保留给未安装包的本地开发。
+`--max-rounds` 是初始完整实验轮预算；每轮包含一次 agent 决策、一次确定性 refit/gate、一次 agent assessment。assessment 会看到本轮刚生成的 refit feedback，并可通过 `request_more_budget` 申请进入下一轮；`--hard-max-rounds` 是绝对上限。loop 结束后会额外生成 `<sample_id>.audit/audit_report.md` 和 `audit_report.json`。报告只汇总已有 loop 历史、fit metrics 和 gate 信号，不替代人工科学裁决。
 
 `fit_control_loop` 的停止原因包括：
 

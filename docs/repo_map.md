@@ -33,6 +33,7 @@ src/astroagent/agent/llm.py
 src/astroagent/agent/fit_control.py
 src/astroagent/agent/loop.py
 src/astroagent/agent/policy.py
+src/astroagent/agent/audit/renderer.py
 src/astroagent/cli/make_review_packet.py
 src/astroagent/cli/run_fit_review.py
 src/astroagent/cli/apply_fit_control_patch.py

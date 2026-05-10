@@ -17,7 +17,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plot-image", type=Path, default=None, help="Initial velocity-frame plot PNG. Defaults beside review JSON.")
     parser.add_argument("--overview-image", type=Path, default=None, help="Initial wavelength-space overview PNG. Defaults beside review JSON when present.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Output directory. Defaults beside review JSON.")
-    parser.add_argument("--max-rounds", type=int, default=3)
+    parser.add_argument("--max-rounds", type=int, default=2, help="Initial experiment budget. The agent may request more rounds.")
+    parser.add_argument("--hard-max-rounds", type=int, default=6, help="Absolute cap for agent-requested experiment rounds.")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--force", action="store_true", help="Run fit-control even when the initial fit is already good.")
     parser.add_argument(
@@ -47,6 +48,7 @@ def main(argv: list[str] | None = None) -> None:
         output_dir=output_dir,
         initial_plot_image_path=image_paths,
         max_rounds=args.max_rounds,
+        hard_max_rounds=args.hard_max_rounds,
         temperature=args.temperature,
         force=args.force,
     )
@@ -59,6 +61,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"final sample id:          {result.final_record.get('sample_id')}")
     if result.final_image_paths:
         print("final image inputs:       " + ", ".join(str(path) for path in result.final_image_paths))
+    if result.audit_paths:
+        print(f"audit report markdown:    {result.audit_paths['audit_markdown']}")
+        print(f"audit report json:        {result.audit_paths['audit_json']}")
 
 
 def _initial_image_paths(

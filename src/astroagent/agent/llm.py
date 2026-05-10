@@ -287,6 +287,22 @@ FIT_CONTROL_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "request_more_budget",
+            "description": "Ask the harness for additional experiment rounds after the default round budget is reached. Use only with a concrete next experiment and evidence from the latest refit feedback.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "requested_rounds": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "next_experiment": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["requested_rounds", "next_experiment", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "add_continuum_anchor",
             "description": "Add a continuum anchor point for local continuum reconstruction.",
             "parameters": {
@@ -545,6 +561,10 @@ def build_fit_control_messages(
         "for both doublet members before refit. Do not collapse different transitions onto one shared velocity axis; "
         "each transition frame keeps its own atomic constants. "
         "Do not call request_refit by itself; pair it with a concrete edit. "
+        "The loop has an initial experiment budget. After you have seen refit feedback, you may call request_more_budget "
+        "when one more concrete experiment is justified by the latest result. request_more_budget is not a refit request; "
+        "pair it with a concrete edit if you already know the next action, or use it alone only when the next call needs to "
+        "inspect the latest feedback before editing. The harness may approve extra rounds up to its hard cap. "
         "If no edit is safe, return JSON with task='fit_control', "
         "status='no_action', tool_calls=[], and a rationale.\n\n"
         + json.dumps(prompt_payload, ensure_ascii=False, indent=2)

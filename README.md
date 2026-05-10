@@ -101,13 +101,14 @@ export ASTROAGENT_LLM_BASE_URL='https://llmapi.paratera.com'
 .venv/bin/python -m astroagent.cli.main fit-loop \
   --review-json outputs/review_packet/demo_CIV_doublet_z2p6000.review.json \
   --client offline \
-  --max-rounds 3
+  --max-rounds 2 \
+  --hard-max-rounds 6
 ```
 
 loop 每轮复用同一套 `fit_control` tool schema、patch 记录和 deterministic refit gate。`offline` client 默认不发工具调用，只验证编排；真实多模态 provider 才会提出 add/update/remove source、mask/window/continuum edits，并触发下一轮 refit。
 如果同目录存在同名 `*.window.csv`、`*.overview.png` 和 `*.plot.png`，loop 入口会自动使用它们；也可以用参数显式覆盖。
 
-loop 不是单次 LLM 调用。每轮会把上一轮已经接受或保留的 overrides 作为下一轮输入，并同时给模型提供观测波长空间总览图和 velocity/residual 诊断图。模型可以一轮提出多个 source、window、mask 或 continuum edits；gate 只负责防止明显退化和记录人工复核状态，不负责最终科学裁决。
+loop 不是单次 LLM 调用。每个实验轮包含两段 agent 交互：先决策 source/window/mask/continuum edits，工具层执行 refit 和 gate；随后 agent 在同一轮看到刚生成的 refit 结果和图，写出简要 assessment，并决定是否通过 `request_more_budget` 申请进入下一轮。gate 只负责防止明显退化和记录人工复核状态，不负责最终科学裁决。loop 结束后还会写出 `<sample_id>.audit/audit_report.md` 和 `audit_report.json`，方便人工快速审查本轮工具动作、gate 结果和后续检查项。
 
 ## 目录分层
 

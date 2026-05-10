@@ -64,6 +64,74 @@ class SequentialToolCallClient:
         return LLMResult(content="", model="unit-sequential-tool-client", raw={"unit": True}, tool_calls=self.responses[index])
 
 
+class FeedbackAwareBudgetClient:
+    def __init__(self, transition_id):
+        self.transition_id = transition_id
+        self.calls = 0
+        self.saw_refit_feedback = False
+
+    def complete(self, messages, *, temperature=0.0, tools=None):
+        text = "\n".join(str(message.content) for message in messages)
+        if "last_refit_feedback" in text:
+            self.saw_refit_feedback = True
+        self.calls += 1
+        if self.calls == 1:
+            tool_calls = [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "add_absorption_source",
+                        "arguments": json.dumps(
+                            {
+                                "transition_line_id": self.transition_id,
+                                "center_velocity_kms": 120.0,
+                                "reason": "first experiment seed",
+                            }
+                        ),
+                    },
+                },
+            ]
+            content = ""
+        elif self.calls == 2:
+            tool_calls = [
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "request_more_budget",
+                        "arguments": json.dumps(
+                            {
+                                "requested_rounds": 1,
+                                "next_experiment": "try a second seed after reviewing this round's refit result",
+                                "reason": "assessment found a justified follow-up experiment",
+                            }
+                        ),
+                    },
+                }
+            ]
+            content = ""
+        else:
+            tool_calls = [
+                {
+                    "id": "call_3",
+                    "type": "function",
+                    "function": {
+                        "name": "add_absorption_source",
+                        "arguments": json.dumps(
+                            {
+                                "transition_line_id": self.transition_id,
+                                "center_velocity_kms": -120.0,
+                                "reason": "second experiment after seeing refit feedback",
+                            }
+                        ),
+                    },
+                }
+            ]
+            content = ""
+        return LLMResult(content=content, model="unit-budget-client", raw={"unit": True}, tool_calls=tool_calls)
+
+
 class FitControlLoopTest(unittest.TestCase):
     def _demo_record_and_window(self):
         spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
@@ -86,12 +154,19 @@ class FitControlLoopTest(unittest.TestCase):
                 max_rounds=2,
                 force=True,
             )
+            self.assertIsNotNone(result.audit_paths)
+            assert result.audit_paths is not None
+            self.assertTrue(result.audit_paths["audit_markdown"].exists())
+            self.assertTrue(result.audit_paths["audit_json"].exists())
+            audit = json.loads(result.audit_paths["audit_json"].read_text(encoding="utf-8"))
 
         self.assertEqual(result.stop_reason, "no_refit_requested")
         self.assertEqual(result.final_record["sample_id"], "loop_demo")
         self.assertEqual(result.final_record["fit_control_loop"]["n_rounds"], 1)
         self.assertEqual(result.final_record["fit_control_loop"]["rounds"][0]["control_status"], "no_action")
         self.assertEqual(result.output_paths, [])
+        self.assertEqual(audit["stop_reason"], "no_refit_requested")
+        self.assertEqual(audit["sample_id"], "loop_demo")
         self.assertNotIn("fit_control_loop", record)
 
     def test_good_fit_is_skipped_unless_forced(self):
@@ -106,10 +181,15 @@ class FitControlLoopTest(unittest.TestCase):
                 output_dir=tmpdir,
                 max_rounds=1,
             )
+            self.assertIsNotNone(result.audit_paths)
+            assert result.audit_paths is not None
+            self.assertTrue(result.audit_paths["audit_markdown"].exists())
+            audit = json.loads(result.audit_paths["audit_json"].read_text(encoding="utf-8"))
 
         self.assertEqual(result.stop_reason, "not_needed_good_fit")
         self.assertEqual(result.history, [])
         self.assertEqual(result.output_paths, [])
+        self.assertEqual(audit["stop_reason"], "not_needed_good_fit")
 
     def test_loop_applies_tool_patch_and_writes_refit_record(self):
         record, window = self._demo_record_and_window()
@@ -127,6 +207,12 @@ class FitControlLoopTest(unittest.TestCase):
             saved = json.loads(final_json.read_text(encoding="utf-8"))
             self.assertTrue(output_paths["overview_png"].exists())
             self.assertTrue(output_paths["plot_png"].exists())
+            assert result.audit_paths is not None
+            self.assertTrue(result.audit_paths["audit_markdown"].exists())
+            self.assertTrue(result.audit_paths["audit_json"].exists())
+            audit = json.loads(result.audit_paths["audit_json"].read_text(encoding="utf-8"))
+            reloaded_final = json.loads(final_json.read_text(encoding="utf-8"))
+            self.assertIn("audit_report_paths", reloaded_final["fit_control_loop"])
 
         self.assertIn(
             result.stop_reason,
@@ -139,6 +225,11 @@ class FitControlLoopTest(unittest.TestCase):
             },
         )
         self.assertEqual(result.final_record["sample_id"], "loop_demo_loop1")
+        self.assertEqual(audit["sample_id"], "loop_demo_loop1")
+        self.assertEqual(audit["task"], "fit_control_audit_report")
+        self.assertTrue(audit["rounds"])
+        self.assertIn("human_action_items", audit)
+        self.assertIn("audit_report_paths", result.final_record["fit_control_loop"])
         self.assertEqual(saved["fit_control_loop"]["task"], "fit_control_loop")
         self.assertEqual(saved["fit_control_loop"]["n_rounds"], 1)
         self.assertEqual(saved["fit_control_loop"]["rounds"][0]["n_tool_calls"], 2)
@@ -147,6 +238,35 @@ class FitControlLoopTest(unittest.TestCase):
             self.assertTrue(saved["fit_control_loop"]["rounds"][0]["advanced"])
         else:
             self.assertFalse(saved["fit_control_loop"]["rounds"][0]["advanced"])
+
+    def test_agent_can_request_more_budget_after_experiment(self):
+        record, window = self._demo_record_and_window()
+        transition_id = record["input"]["transitions"][0]["transition_line_id"]
+        client = FeedbackAwareBudgetClient(transition_id)
+        with tempfile.TemporaryDirectory(prefix="astroagent_loop_budget_") as tmpdir:
+            result = run_fit_control_loop(
+                record=record,
+                window=window,
+                client=client,
+                output_dir=tmpdir,
+                max_rounds=1,
+                hard_max_rounds=2,
+                force=True,
+            )
+
+        self.assertEqual(client.calls, 4)
+        self.assertTrue(client.saw_refit_feedback)
+        self.assertEqual(result.final_record["fit_control_loop"]["n_rounds"], 2)
+        first_round = result.final_record["fit_control_loop"]["rounds"][0]
+        second_round = result.final_record["fit_control_loop"]["rounds"][1]
+        self.assertEqual(first_round["decision_control_status"], "tool_calls")
+        self.assertEqual(first_round["assessment_control_status"], "tool_calls")
+        self.assertEqual(second_round["decision_control_status"], "tool_calls")
+        self.assertEqual(second_round["assessment_control_status"], "tool_calls")
+        self.assertTrue(first_round["budget_decision"]["approved"])
+        self.assertEqual(first_round["budget_decision"]["new_round_limit"], 2)
+        self.assertEqual(len(result.history), 2)
+        self.assertEqual(len(result.output_paths), 2)
 
     def test_repeated_distinct_component_updates_are_coerced_to_added_sources(self):
         patch = {

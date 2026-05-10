@@ -7,6 +7,7 @@ from typing import Any, Sequence
 
 import pandas as pd
 
+from astroagent.agent.audit import render_fit_control_audit_report
 from astroagent.agent.fit_control import (
     build_fit_control_overrides,
     build_fit_control_patch,
@@ -25,6 +26,7 @@ class FitControlLoopResult:
     history: list[dict[str, Any]]
     stop_reason: str
     output_paths: list[dict[str, Path]]
+    audit_paths: dict[str, Path] | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ def run_fit_control_loop(
     output_dir: str | Path,
     initial_plot_image_path: str | Path | Sequence[str | Path] | None = None,
     max_rounds: int = 3,
+    hard_max_rounds: int | None = None,
     temperature: float = 0.0,
     sample_id_prefix: str | None = None,
     force: bool = False,
@@ -72,6 +75,9 @@ def run_fit_control_loop(
     """
     if max_rounds < 1:
         raise ValueError("max_rounds must be >= 1")
+    effective_hard_max_rounds = int(hard_max_rounds) if hard_max_rounds is not None else max(int(max_rounds), 6)
+    if effective_hard_max_rounds < int(max_rounds):
+        raise ValueError("hard_max_rounds must be >= max_rounds")
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -83,6 +89,7 @@ def run_fit_control_loop(
     history: list[dict[str, Any]] = []
     output_paths: list[dict[str, Path]] = []
     stop_reason = "max_rounds_reached"
+    approved_round_limit = int(max_rounds)
     base_id = sample_id_prefix or str(record.get("sample_id", "fit_control_loop"))
     best_record: dict[str, Any] | None = None
     best_plot: list[Path] | None = None
@@ -93,15 +100,24 @@ def run_fit_control_loop(
     if not force and not _fit_control_needed(state.record):
         stop_reason = "not_needed_good_fit"
         state.record["fit_control_loop"] = _loop_record(history, stop_reason=stop_reason)
+        audit_paths = _write_loop_audit(
+            record=state.record,
+            history=history,
+            stop_reason=stop_reason,
+            output_path=output_path,
+            output_paths=output_paths,
+        )
         return FitControlLoopResult(
             final_record=state.record,
             final_image_paths=state.image_paths,
             history=history,
             stop_reason=stop_reason,
             output_paths=output_paths,
+            audit_paths=audit_paths,
         )
 
-    for round_index in range(1, int(max_rounds) + 1):
+    round_index = 1
+    while round_index <= approved_round_limit:
         image_paths = state.image_paths
         rejected_feedback = state.record.get("fit_control_last_rejected_refit")
         if image_paths and isinstance(rejected_feedback, dict):
@@ -128,6 +144,7 @@ def run_fit_control_loop(
             "round_index": round_index,
             "input_sample_id": state.record.get("sample_id"),
             "control": control,
+            "decision_control": control,
             "patch": effective_patch,
             "new_patch": patch,
             "round_overrides": round_overrides,
@@ -136,9 +153,21 @@ def run_fit_control_loop(
             "advanced": False,
             "candidate_score": None,
             "selected_candidate": False,
+            "budget_request": None,
+            "budget_decision": None,
+            "assessment_control": None,
+            "assessment_summary": None,
         }
 
         if not patch.get("requires_refit"):
+            budget_decision = _decide_budget_request(
+                patch,
+                round_index=round_index,
+                approved_round_limit=approved_round_limit,
+                hard_max_rounds=effective_hard_max_rounds,
+                decision="no_refit",
+            )
+            round_entry["budget_decision"] = budget_decision
             stop_reason = "no_refit_requested"
             history.append(round_entry)
             break
@@ -166,7 +195,32 @@ def run_fit_control_loop(
             }
         )
 
-        is_last_round = round_index == int(max_rounds)
+        assessment_control, assessment_patch = _run_round_assessment(
+            candidate=candidate,
+            client=client,
+            temperature=temperature,
+            patch=patch,
+            evaluation=evaluation,
+            history=[*history, round_entry],
+            round_index=round_index,
+            approved_round_limit=approved_round_limit,
+            hard_max_rounds=effective_hard_max_rounds,
+        )
+        round_entry["assessment_control"] = assessment_control
+        round_entry["assessment_summary"] = assessment_control.get("rationale")
+        budget_patch = assessment_patch
+        round_entry["budget_request"] = _budget_request_from_patch(assessment_patch)
+        budget_decision = _decide_budget_request(
+            budget_patch,
+            round_index=round_index,
+            approved_round_limit=approved_round_limit,
+            hard_max_rounds=effective_hard_max_rounds,
+            decision=decision,
+        )
+        if budget_decision.get("approved"):
+            approved_round_limit = int(budget_decision["new_round_limit"])
+        round_entry["budget_decision"] = budget_decision
+        is_last_round = round_index == approved_round_limit
         candidate_score = candidate.score
         round_entry["candidate_score"] = candidate_score
         history.append(round_entry)
@@ -188,11 +242,13 @@ def run_fit_control_loop(
                 "evaluation": evaluation,
                 "patch": patch,
                 "fit_summary": candidate.record.get("fit_results", [{}])[0],
+                "assessment_control": assessment_control,
             }
             trial_controls = candidate.controls
             if is_last_round:
                 stop_reason = "refit_rejected"
                 break
+            round_index += 1
             continue
         if decision == "needs_human_review":
             stop_reason = "needs_human_review" if is_last_round else "continue_after_human_review_warning"
@@ -214,7 +270,10 @@ def run_fit_control_loop(
                 "evaluation": evaluation,
                 "patch": patch,
                 "fit_summary": candidate.record.get("fit_results", [{}])[0],
+                "budget_decision": budget_decision,
+                "assessment_control": assessment_control,
             }
+            round_index += 1
             continue
 
         round_entry["advanced"] = True
@@ -231,8 +290,11 @@ def run_fit_control_loop(
             "evaluation": evaluation,
             "patch": patch,
             "fit_summary": candidate.record.get("fit_results", [{}])[0],
+            "budget_decision": budget_decision,
+            "assessment_control": assessment_control,
         }
         trial_controls = state.controls
+        round_index += 1
 
     else:
         stop_reason = "max_rounds_reached"
@@ -256,13 +318,85 @@ def run_fit_control_loop(
         final_paths = write_review_packet(current_record, window, output_path)
         output_paths[-1] = final_paths
         current_plot = _image_paths([final_paths["overview_png"], final_paths["plot_png"]])
+    audit_paths = _write_loop_audit(
+        record=current_record,
+        history=history,
+        stop_reason=stop_reason,
+        output_path=output_path,
+        output_paths=output_paths,
+    )
+    if output_paths and current_record.get("sample_id") != record.get("sample_id"):
+        final_paths = write_review_packet(current_record, window, output_path)
+        output_paths[-1] = final_paths
     return FitControlLoopResult(
         final_record=current_record,
         final_image_paths=current_plot,
         history=history,
         stop_reason=stop_reason,
         output_paths=output_paths,
+        audit_paths=audit_paths,
     )
+
+
+def _write_loop_audit(
+    *,
+    record: dict[str, Any],
+    history: list[dict[str, Any]],
+    stop_reason: str,
+    output_path: Path,
+    output_paths: list[dict[str, Path]],
+) -> dict[str, Path]:
+    audit_paths = render_fit_control_audit_report(
+        record=record,
+        history=history,
+        stop_reason=stop_reason,
+        output_dir=output_path,
+        output_paths=output_paths,
+    )
+    loop = record.setdefault("fit_control_loop", _loop_record(history, stop_reason=stop_reason))
+    loop["audit_report_paths"] = {key: str(value) for key, value in audit_paths.items()}
+    return audit_paths
+
+
+def _run_round_assessment(
+    *,
+    candidate: FitControlCandidate,
+    client: LLMClient,
+    temperature: float,
+    patch: dict[str, Any],
+    evaluation: dict[str, Any],
+    history: list[dict[str, Any]],
+    round_index: int,
+    approved_round_limit: int,
+    hard_max_rounds: int,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Let the agent inspect this same round's refit result and decide whether to continue."""
+    feedback_record = deepcopy(candidate.record)
+    feedback_record["fit_control_loop"] = _loop_record(history, stop_reason="round_assessment")
+    feedback_record["fit_control_last_refit_feedback"] = {
+        "sample_id": candidate.record.get("sample_id"),
+        "evaluation": evaluation,
+        "patch": patch,
+        "fit_summary": candidate.record.get("fit_results", [{}])[0],
+        "round_assessment": {
+            "round_index": int(round_index),
+            "approved_round_limit": int(approved_round_limit),
+            "hard_max_rounds": int(hard_max_rounds),
+            "instruction": (
+                "This is the assessment step of the same experiment round. Briefly analyze whether the refit improved, "
+                "worsened, or needs human review. Return no_action/inspect if the loop should stop. Call request_more_budget "
+                "only if the next round has a concrete justified experiment."
+            ),
+        },
+    }
+    control = run_fit_control(
+        feedback_record,
+        client,
+        temperature=temperature,
+        plot_image_path=candidate.image_paths,
+    )
+    assessment_patch = build_fit_control_patch(control, source=f"round_assessment_{round_index}")
+    return control, assessment_patch
 
 
 def _loop_record(history: list[dict[str, Any]], stop_reason: str | None) -> dict[str, Any]:
@@ -281,6 +415,9 @@ def _loop_record(history: list[dict[str, Any]], stop_reason: str | None) -> dict
                 "input_sample_id": entry.get("input_sample_id"),
                 "output_sample_id": entry.get("output_sample_id"),
                 "control_status": entry.get("control", {}).get("status"),
+                "decision_control_status": entry.get("decision_control", {}).get("status")
+                if isinstance(entry.get("decision_control"), dict)
+                else None,
                 "n_tool_calls": int(len(entry.get("patch", {}).get("tool_calls", []))),
                 "n_new_tool_calls": int(len(entry.get("new_patch", {}).get("tool_calls", []))),
                 "new_tool_calls": _public_tool_calls(entry.get("new_patch", {}).get("tool_calls", [])),
@@ -291,6 +428,12 @@ def _loop_record(history: list[dict[str, Any]], stop_reason: str | None) -> dict
                 "overrides_summary": entry.get("overrides_summary", {}),
                 "candidate_score": list(entry["candidate_score"]) if entry.get("candidate_score") is not None else None,
                 "selected_candidate": bool(entry.get("selected_candidate")),
+                "budget_request": entry.get("budget_request"),
+                "budget_decision": entry.get("budget_decision"),
+                "assessment_control_status": entry.get("assessment_control", {}).get("status")
+                if isinstance(entry.get("assessment_control"), dict)
+                else None,
+                "assessment_summary": entry.get("assessment_summary"),
                 "gate_reasons": entry.get("gate_reasons", []),
                 "gate_warnings": entry.get("gate_warnings", []),
                 "gate_metrics": entry.get("gate_metrics", {}),
@@ -311,6 +454,70 @@ def _public_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]
         }
         public.append(item)
     return public
+
+
+def _budget_request_from_patch(patch: dict[str, Any]) -> dict[str, Any] | None:
+    for call in patch.get("tool_calls", []):
+        if call.get("name") == "request_more_budget":
+            args = call.get("arguments", {})
+            return args if isinstance(args, dict) else {}
+    return None
+
+
+def _decide_budget_request(
+    patch: dict[str, Any],
+    *,
+    round_index: int,
+    approved_round_limit: int,
+    hard_max_rounds: int,
+    decision: str | None,
+) -> dict[str, Any]:
+    request = _budget_request_from_patch(patch)
+    if request is None:
+        return {
+            "requested": False,
+            "approved": False,
+            "round_limit": int(approved_round_limit),
+            "hard_max_rounds": int(hard_max_rounds),
+        }
+    requested_rounds = max(1, int(_score_float(request.get("requested_rounds"), default=1.0)))
+    if approved_round_limit >= hard_max_rounds:
+        return {
+            "requested": True,
+            "approved": False,
+            "reason": "hard_max_rounds_reached",
+            "round_limit": int(approved_round_limit),
+            "hard_max_rounds": int(hard_max_rounds),
+            "request": request,
+        }
+    if decision == "rejected":
+        return {
+            "requested": True,
+            "approved": False,
+            "reason": "last_refit_rejected",
+            "round_limit": int(approved_round_limit),
+            "hard_max_rounds": int(hard_max_rounds),
+            "request": request,
+        }
+    if decision == "no_refit":
+        return {
+            "requested": True,
+            "approved": False,
+            "reason": "no_refit_result_to_review",
+            "round_limit": int(approved_round_limit),
+            "hard_max_rounds": int(hard_max_rounds),
+            "request": request,
+        }
+    new_limit = min(hard_max_rounds, max(approved_round_limit, round_index) + requested_rounds)
+    return {
+        "requested": True,
+        "approved": new_limit > approved_round_limit,
+        "reason": "approved_for_agent_experiment" if new_limit > approved_round_limit else "no_additional_rounds_available",
+        "round_limit": int(approved_round_limit),
+        "new_round_limit": int(new_limit),
+        "hard_max_rounds": int(hard_max_rounds),
+        "request": request,
+    }
 
 
 def _image_paths(value: str | Path | Sequence[str | Path] | None) -> list[Path] | None:
