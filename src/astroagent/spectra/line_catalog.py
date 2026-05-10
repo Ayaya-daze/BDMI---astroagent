@@ -63,6 +63,31 @@ def primary_rest_wavelength_A(
     return rest_wavelengths_A(line_id, catalog)[0]
 
 
+def line_family_context(
+    line_id: str,
+    catalog: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Return soft background context for LLM/human review."""
+    catalog_data = catalog if catalog is not None else load_line_catalog()
+    definition = get_line_definition(line_id, catalog_data)
+    transition_ids = [str(item) for item in definition.get("transition_line_ids", [])]
+    strengths = oscillator_strengths(line_id, catalog_data)
+    strongest_index = max(range(len(strengths)), key=lambda index: strengths[index]) if strengths else 0
+    strongest_transition = transition_ids[strongest_index] if transition_ids and strongest_index < len(transition_ids) else line_id
+    return {
+        "line_id": line_id,
+        "family": definition.get("family", line_id),
+        "ion": definition.get("ion"),
+        "role": definition.get("role", "transition"),
+        "multiplet_type": definition.get("multiplet_type", definition.get("role", "transition")),
+        "transition_line_ids": transition_ids,
+        "oscillator_strengths": strengths,
+        "oscillator_strength_ratio": definition.get("oscillator_strength_ratio"),
+        "strongest_transition_line_id": strongest_transition,
+        "soft_background": definition.get("soft_background", {}),
+    }
+
+
 def transition_definitions(
     line_id: str,
     catalog: dict[str, dict[str, Any]] | None = None,
@@ -90,6 +115,9 @@ def transition_definitions(
                     "damping_gamma_kms": float(transition_definition.get("damping_gamma_kms", 0.001)),
                     "atomic_label": transition_definition.get("atomic_label"),
                     "role": transition_definition.get("role", "transition"),
+                    "ion": transition_definition.get("ion", definition.get("ion")),
+                    "partner_line_id": transition_definition.get("partner_line_id"),
+                    "family_context": transition_definition.get("family_context"),
                 }
             )
         return transitions
@@ -110,7 +138,9 @@ def transition_definitions(
             "damping_gamma_kms": float(definition.get("damping_gamma_kms", 0.001)),
             "atomic_label": definition.get("atomic_label"),
             "role": definition.get("role", "transition"),
+            "ion": definition.get("ion"),
+            "partner_line_id": definition.get("partner_line_id"),
+            "family_context": definition.get("family_context"),
         }
         for transition_line_id, rest, strength in zip(transition_ids, rests, strengths, strict=True)
     ]
-

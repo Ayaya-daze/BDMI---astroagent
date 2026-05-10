@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
 
-from astroagent.spectra.line_catalog import load_line_catalog, primary_rest_wavelength_A, rest_wavelengths_A, transition_definitions
+from astroagent.spectra.line_catalog import load_line_catalog, line_family_context, primary_rest_wavelength_A, rest_wavelengths_A, transition_definitions
 from astroagent.agent.policy import SOURCE_CORE_WINDOW_KMS, SOURCE_WORK_WINDOW_KMS
 from astroagent.review.continuum import C_KMS, build_plot_data, observed_wavelength_A, validate_spectrum_table, velocity_kms
 from astroagent.review.plot import build_smooth_voigt_model_data, save_review_plot, save_window_overview_plot
@@ -57,6 +57,7 @@ def cut_local_window(
             }
             for transition in transitions
         ],
+        "line_family_context": line_family_context(line_id, catalog),
         "primary_observed_center_A": primary_center,
         "window_reference_A": float(window_reference_A),
         "window_min_A": float(window_min),

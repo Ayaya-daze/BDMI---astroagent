@@ -636,6 +636,18 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertIn("intrinsic_fit_window_metrics", text)
         self.assertIn("lsf_fit_window_metrics", text)
 
+    def test_fit_control_prompt_includes_soft_doublet_context_and_outlier_policy(self):
+        record = self._demo_record()
+
+        messages = build_fit_control_messages(record)
+        text = messages[1].content
+
+        self.assertIn("line_family_context", text)
+        self.assertIn("soft physical background", text)
+        self.assertIn("not an automatic failure", text)
+        self.assertIn("Preserve and report single-member", text)
+        self.assertIn("outlier_policy", text)
+
     def test_continuum_changed_carryover_sources_are_soft_position_priors(self):
         original_fit = {
             "components": [

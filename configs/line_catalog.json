@@ -1,64 +1,98 @@
 {
   "CIV_1548": {
     "family": "CIV",
+    "ion": "C IV",
     "rest_wavelength_A": 1548.204,
     "oscillator_strength": 0.1908,
     "damping_gamma_kms": 0.00324,
     "atomic_label": "CIV1548",
     "role": "doublet_member",
-    "partner_line_id": "CIV_1550"
+    "partner_line_id": "CIV_1550",
+    "family_context": "likely C IV doublet member; compare with sibling transition as supporting evidence, not as a hard filter"
   },
   "CIV_1550": {
     "family": "CIV",
+    "ion": "C IV",
     "rest_wavelength_A": 1550.781,
     "oscillator_strength": 0.09522,
     "damping_gamma_kms": 0.00325,
     "atomic_label": "CIV1550",
     "role": "doublet_member",
-    "partner_line_id": "CIV_1548"
+    "partner_line_id": "CIV_1548",
+    "family_context": "likely C IV doublet member; compare with sibling transition as supporting evidence, not as a hard filter"
   },
   "CIV_doublet": {
     "family": "CIV",
+    "ion": "C IV",
     "rest_wavelengths_A": [1548.204, 1550.781],
     "oscillator_strengths": [0.1908, 0.09522],
     "damping_gamma_kms": [0.00324, 0.00325],
     "transition_line_ids": ["CIV_1548", "CIV_1550"],
     "primary_rest_wavelength_A": 1548.204,
-    "role": "doublet"
+    "role": "doublet",
+    "multiplet_type": "doublet",
+    "oscillator_strength_ratio": [2.0038, 1.0],
+    "soft_background": {
+      "summary": "C IV is a likely doublet: similar velocity features across CIV_1548 and CIV_1550 support the absorber interpretation.",
+      "expected_relation": "For an unsaturated clean absorber, the stronger 1548 member is usually deeper than the 1550 member at similar velocity; saturated lines can approach a 1:1 depth ratio.",
+      "outlier_policy": "Do not discard single-member or inconsistent features automatically. Preserve and report them as possible blends, contamination, bad pixels, low S/N, saturation, edge effects, or ambiguous real cases.",
+      "agent_guidance": "Use sibling agreement as evidence, not a hard rule. If only one member shows a feature, keep it visible and report the mismatch rather than deleting it by default."
+    }
   },
   "HI_LYA": {
     "family": "HI",
+    "ion": "H I",
     "rest_wavelength_A": 1215.6701,
     "oscillator_strength": 0.4164,
     "damping_gamma_kms": 0.00455,
     "atomic_label": "HI1215",
-    "role": "single_line"
+    "role": "single_line",
+    "multiplet_type": "single",
+    "soft_background": {
+      "summary": "H I Ly-alpha is a single transition in this catalog entry.",
+      "expected_relation": "There is no doublet sibling panel for direct same-ion confirmation in this local view.",
+      "outlier_policy": "Preserve unusual residuals and report possible blends, contamination, bad pixels, low S/N, saturation, or ambiguous real cases.",
+      "agent_guidance": "Do not require sibling support for H I Ly-alpha; use local profile shape, masks, continuum, and external context."
+    }
   },
   "MGII_2796": {
     "family": "MGII",
+    "ion": "Mg II",
     "rest_wavelength_A": 2796.352,
     "oscillator_strength": 0.6123,
     "damping_gamma_kms": 0.00578,
     "atomic_label": "MgII2796",
     "role": "doublet_member",
-    "partner_line_id": "MGII_2803"
+    "partner_line_id": "MGII_2803",
+    "family_context": "likely Mg II doublet member; compare with sibling transition as supporting evidence, not as a hard filter"
   },
   "MGII_2803": {
     "family": "MGII",
+    "ion": "Mg II",
     "rest_wavelength_A": 2803.531,
     "oscillator_strength": 0.3054,
     "damping_gamma_kms": 0.00573,
     "atomic_label": "MgII2803",
     "role": "doublet_member",
-    "partner_line_id": "MGII_2796"
+    "partner_line_id": "MGII_2796",
+    "family_context": "likely Mg II doublet member; compare with sibling transition as supporting evidence, not as a hard filter"
   },
   "MGII_doublet": {
     "family": "MGII",
+    "ion": "Mg II",
     "rest_wavelengths_A": [2796.352, 2803.531],
     "oscillator_strengths": [0.6123, 0.3054],
     "damping_gamma_kms": [0.00578, 0.00573],
     "transition_line_ids": ["MGII_2796", "MGII_2803"],
     "primary_rest_wavelength_A": 2796.352,
-    "role": "doublet"
+    "role": "doublet",
+    "multiplet_type": "doublet",
+    "oscillator_strength_ratio": [2.0056, 1.0],
+    "soft_background": {
+      "summary": "Mg II is a likely doublet: similar velocity features across MGII_2796 and MGII_2803 support the absorber interpretation.",
+      "expected_relation": "For an unsaturated clean absorber, the stronger 2796 member is usually deeper than the 2803 member at similar velocity; saturated lines can approach a 1:1 depth ratio.",
+      "outlier_policy": "Do not discard single-member or inconsistent features automatically. Preserve and report them as possible blends, contamination, bad pixels, low S/N, saturation, edge effects, or ambiguous real cases.",
+      "agent_guidance": "Use sibling agreement as evidence, not a hard rule. If only one member shows a feature, keep it visible and report the mismatch rather than deleting it by default."
+    }
   }
 }

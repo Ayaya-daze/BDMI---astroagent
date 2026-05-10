@@ -11,6 +11,7 @@ __all__ = [
     "detect_absorption_peaks",
     "fit_voigt_absorption",
     "get_line_definition",
+    "line_family_context",
     "load_line_catalog",
     "normalized_voigt_velocity",
     "oscillator_strengths",
@@ -23,6 +24,7 @@ __all__ = [
 
 _EXPORTS = {
     "get_line_definition": "astroagent.spectra.line_catalog",
+    "line_family_context": "astroagent.spectra.line_catalog",
     "load_line_catalog": "astroagent.spectra.line_catalog",
     "oscillator_strengths": "astroagent.spectra.line_catalog",
     "primary_rest_wavelength_A": "astroagent.spectra.line_catalog",

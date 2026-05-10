@@ -415,6 +415,10 @@ def build_fit_control_messages(
     )
     user_text = (
         "Task: fit_control. Inspect the wavelength-space overview image first, then the transition-frame fit image. "
+        "Use input.line_family_context as soft physical background. If the line is a doublet or multiplet, sibling "
+        "agreement at similar velocity is supporting evidence, but mismatch is not an automatic failure. Preserve and "
+        "report single-member or inconsistent features as possible blends, contamination, bad pixels, low S/N, saturation, "
+        "edge effects, or ambiguous real cases; do not delete or mask them solely because the sibling panel is weaker or absent. "
         "First decide whether the continuum is trustworthy across the target doublet window. Check whether the fitted "
         "continuum follows uncontaminated flux on both sides of the absorption complex, whether saturated troughs or "
         "doublet/blend edges have pulled the continuum down, and whether continuum anchors/masks are missing or biased. "
@@ -559,7 +563,9 @@ def build_fit_control_messages(
         "markers, consider exploratory add_absorption_source calls on the inner wings or midpoint/blend region in the "
         "appropriate transition velocity frames, and consider set_fit_window with sibling_mask_mode='allow_overlap' "
         "for both doublet members before refit. Do not collapse different transitions onto one shared velocity axis; "
-        "each transition frame keeps its own atomic constants. "
+        "each transition frame keeps its own atomic constants. Treat doublet/multiplet relations as probabilistic context: "
+        "sibling-supported features are stronger evidence, but outliers should be retained and reported unless there is "
+        "specific visible evidence for contamination or a fit-control edit. "
         "Do not call request_refit by itself; pair it with a concrete edit. "
         "The loop has an initial experiment budget. After you have seen refit feedback, you may call request_more_budget "
         "when one more concrete experiment is justified by the latest result. request_more_budget is not a refit request; "

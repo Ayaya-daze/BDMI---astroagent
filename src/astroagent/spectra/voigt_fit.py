@@ -960,6 +960,9 @@ def fit_voigt_absorption(
             "oscillator_strength": oscillator_strength,
             "damping_gamma_kms": damping_gamma_kms,
             "atomic_label": transition.get("atomic_label"),
+            "ion": transition.get("ion"),
+            "partner_line_id": transition.get("partner_line_id"),
+            "family_context": transition.get("family_context"),
             "observed_center_A": float(observed_center_A),
             "velocity_frame": {
                 "zero": "transition observed center from rest_wavelength_A * (1 + z_sys)",
