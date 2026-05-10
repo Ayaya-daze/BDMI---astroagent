@@ -300,6 +300,7 @@ class ReviewPacketTest(unittest.TestCase):
         }
 
         plot_window, _, fit_summary = build_plot_and_fit_data(window, metadata)
+        model_data = review_plot.build_smooth_voigt_model_data(fit_summary)
 
         self.assertTrue(fit_summary["lsf"]["available"])
         self.assertTrue(fit_summary["instrument_lsf_applied"])
@@ -315,6 +316,7 @@ class ReviewPacketTest(unittest.TestCase):
         self.assertEqual(len(frame["residual_samples"]), len(frame["lsf_diagnostic"]["residual_samples"]))
         self.assertTrue(plot_window["voigt_model"].notna().any())
         self.assertTrue(plot_window["voigt_lsf_model"].notna().any())
+        self.assertTrue(model_data["smooth_lsf_model"].notna().any())
         self.assertFalse(
             np.allclose(
                 plot_window["voigt_model"].dropna().to_numpy(dtype=float),

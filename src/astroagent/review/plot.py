@@ -113,6 +113,7 @@ def build_smooth_voigt_model_data(
         for frame in fit_summary.get("transition_frames", [])
         if frame.get("transition_line_id")
     }
+    lsf_samples_by_id = _lsf_model_samples_by_transition(fit_summary)
     for transition_line_id, curves in component_curves.items():
         frame = frames_by_id.get(transition_line_id, {})
         bounds = frame.get("velocity_frame", {}).get("bounds_kms")
@@ -131,6 +132,10 @@ def build_smooth_voigt_model_data(
         lsf_matrix = _resample_lsf_matrix(lsf_by_transition.get(transition_line_id), len(total_model))
         if lsf_matrix is not None:
             lsf_model = apply_lsf_matrix(total_model, lsf_matrix)
+        elif transition_line_id in lsf_samples_by_id:
+            sample_velocity, sample_model = lsf_samples_by_id[transition_line_id]
+            if len(sample_velocity) >= 2:
+                lsf_model = np.interp(velocity_grid, sample_velocity, sample_model, left=np.nan, right=np.nan)
 
         observed_center_A = float(frame.get("observed_center_A", np.nan))
         wavelength = observed_center_A * (1.0 + velocity_grid / C_KMS) if np.isfinite(observed_center_A) else np.full_like(velocity_grid, np.nan)
@@ -191,6 +196,29 @@ def _resample_lsf_matrix(matrix: np.ndarray | None, n_pixels: int) -> np.ndarray
     if matrix.shape == (int(n_pixels), int(n_pixels)):
         return matrix
     return None
+
+
+def _lsf_model_samples_by_transition(fit_summary: dict[str, Any]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    samples_by_transition: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for frame in fit_summary.get("transition_frames", []):
+        transition_line_id = str(frame.get("transition_line_id", ""))
+        diagnostic = frame.get("lsf_diagnostic", {})
+        samples = diagnostic.get("residual_samples", []) if isinstance(diagnostic, dict) else []
+        if not transition_line_id or not isinstance(samples, list):
+            continue
+        rows = [
+            (float(sample.get("velocity_kms")), float(sample.get("model_flux")))
+            for sample in samples
+            if _finite_float(sample.get("velocity_kms")) is not None and _finite_float(sample.get("model_flux")) is not None
+        ]
+        if len(rows) < 2:
+            continue
+        rows.sort(key=lambda item: item[0])
+        samples_by_transition[transition_line_id] = (
+            np.asarray([item[0] for item in rows], dtype=float),
+            np.asarray([item[1] for item in rows], dtype=float),
+        )
+    return samples_by_transition
 
 
 def _component_posterior_band(
