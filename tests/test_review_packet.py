@@ -214,6 +214,7 @@ class ReviewPacketTest(unittest.TestCase):
             ].dropna().unique()
         )
         self.assertEqual(reloaded_model_centers, json_centers)
+        self.assertEqual(saved["input"]["line_family_context"]["multiplet_type"], "doublet")
         self.assertNotIn("_plot_window", saved)
         self.assertNotIn("_fit_summary", saved)
 

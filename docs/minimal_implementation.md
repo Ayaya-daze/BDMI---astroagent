@@ -11,8 +11,8 @@
 
 ## 文件职责
 
-- `configs/line_catalog.json`：谱线常量表。现在包含 C IV、H I Ly alpha、Mg II。
-- `src/astroagent/spectra/line_catalog.py`：读取谱线表，负责 `line_id -> transition definitions`。
+- `configs/line_catalog.json`：谱线常量表和 line-family 软背景知识。现在包含 C IV、H I Ly alpha、Mg II。
+- `src/astroagent/spectra/line_catalog.py`：读取谱线表，负责 `line_id -> transition definitions` 和 `line_family_context`。
 - `src/astroagent/review/packet.py`：审查包编排入口，负责切窗、摘要、fit summary 组装、rule baseline、写出审查包。
 - `src/astroagent/review/continuum.py`：连续谱、归一化谱、局域速度坐标和吸收核心 exclusion。
 - `src/astroagent/review/plot.py`：平滑 Voigt 曲线、per-transition velocity-frame 诊断图。
@@ -44,8 +44,9 @@ outputs/review_packet/
 - `*.review.json`：结构化审查记录。
 - `*.window.csv`：局域谱窗数组，包含 `wavelength / flux / ivar / pipeline_mask / velocity_kms`。
 - `*.plot.csv`：画图和拟合专用数组，包含连续谱、归一化谱和第一层拟合列。
-- `*.model.csv`：速度空间平滑 Voigt 曲线，`component` 是单峰曲线，`combined` 是同一 transition 内所有峰的合成曲线。
-- `*.plot.png`：ABSpec 风格的拟合诊断图；每条 transition 一个局部速度坐标子图，不输出波长空间总览图。
+- `*.model.csv`：速度空间平滑 Voigt 曲线，`component` 是单峰曲线，`combined` 是同一 transition 内所有峰的合成曲线；有 LSF 诊断时包含 `smooth_lsf_model`。
+- `*.overview.png`：观测波长空间总览图。
+- `*.plot.png`：ABSpec 风格的拟合诊断图；每条 transition 一个局部速度坐标子图。
 - `*.llm_control.json`：运行 LLM control 入口后得到的第一层多模态拟合控制输出。
 - `*.fit_control_patch.json`：运行 LLM control 入口后得到的归一化 patch，可用于下一轮 refit。
 - `README.md`：输出文件说明。
@@ -71,6 +72,7 @@ outputs/review_packet/
 先打开生成的 `*.review.json`，重点看：
 
 - `input`：谱线假设、系统红移、观测中心波长、窗口范围。
+- `input.line_family_context`：来自线表的软背景知识；doublet/multiplet 一致性只是支持证据，不是硬过滤规则，单成员或不一致特征要保留并报告。
 - `window_summary`：像素数、坏像素比例、flux 分位数、粗略 SNR。
 - `absorber_hypothesis_check`：粗窗口里是否有数据驱动的吸收谷，只负责告诉你有没有值得进入第一层拟合的结构。
 - `human_adjudication`：明确哪些科学裁决必须由人完成，例如 virial velocity 冲突或多元素不一致。
@@ -90,7 +92,9 @@ outputs/review_packet/
 4. 确定性 fitter 重新生成 `*_refit.review.json`、`*_refit.plot.csv`、`*_refit.model.csv` 和 `*_refit.plot.png`。
 5. Voigt component 的公开参数、model、residual 和 interval 只接受 UltraNest posterior median / q16 / q84。least-squares/MAP 只作为 initializer 和诊断参考；posterior 不可用或不完整时不回退 initializer，而是标记需要 review。
 6. `fit_control_evaluation` 比较原始 fit 和 refit：失败、RMS 明显变差、组件数暴涨、fit pixel 被 mask 掉太多或 quality 退化时，patch 用内部兼容字段标记为 `rejected`，含义是不进入主状态、效果可能变差；仍有 high residual / inspect 信号时标记为 `needs_human_review`；只有无新增警告的改善才自动 `accepted`。
-7. `scripts/run_fit_control_loop.py` 在同一套 patch/refit/gate 上做多轮编排。每轮会继承上一轮已保留的 overrides，LLM 可以一次提出多个 source、window、mask 或 continuum edits。
+7. 如果 metadata 提供 per-transition LSF/resolution matrix，工具层会额外输出 LSF-convolved model/residual 诊断；主 likelihood 和公开参数仍保持 intrinsic Voigt，不猜 LSF。
+8. `scripts/run_fit_control_loop.py` 在同一套 patch/refit/gate 上做多轮编排。每轮会继承上一轮已保留的 overrides，LLM 可以一次提出多个 source、window、mask 或 continuum edits。
+9. 每个实验轮包含 agent 决策、确定性 refit/gate、同轮 agent assessment；assessment 可通过 `request_more_budget` 申请继续，但不能绕过 `hard-max-rounds`。
 
 这还不是定稿拟合方案。它只用于验证第一层大模型能通过工具调用参与拟合输入修正，并为后续 RL 记录 action -> refit result。
 

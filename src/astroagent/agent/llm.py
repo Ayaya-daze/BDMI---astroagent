@@ -718,7 +718,7 @@ def validate_fit_review(review: dict[str, Any]) -> None:
 
 
 def _compact_fit_summary(fit_summary: dict[str, Any]) -> dict[str, Any]:
-    transition_frames = _strip_fit_initializer_fields(fit_summary.get("transition_frames"))
+    transition_frames = _compact_transition_frames(fit_summary.get("transition_frames"))
     components = _strip_fit_initializer_fields(fit_summary.get("components"))
     return {
         "fit_type": fit_summary.get("fit_type"),
@@ -740,6 +740,58 @@ def _compact_fit_summary(fit_summary: dict[str, Any]) -> dict[str, Any]:
         "agent_review": fit_summary.get("agent_review"),
         "transition_frames": transition_frames,
         "components": components,
+    }
+
+
+def _compact_transition_frames(value: Any) -> Any:
+    frames = _strip_fit_initializer_fields(value)
+    if not isinstance(frames, list):
+        return frames
+    return [_compact_transition_frame(frame) for frame in frames]
+
+
+def _compact_transition_frame(frame: Any) -> Any:
+    if not isinstance(frame, dict):
+        return frame
+    compact = dict(frame)
+    diagnostic = compact.get("lsf_diagnostic")
+    if isinstance(diagnostic, dict) and diagnostic.get("available"):
+        compact["lsf_diagnostic"] = _compact_lsf_diagnostic(diagnostic)
+    return compact
+
+
+def _compact_lsf_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        key: value
+        for key, value in diagnostic.items()
+        if key not in {"residual_samples", "diagnostic_residual_samples"}
+    }
+    compact["residual_sample_summary"] = _compact_lsf_residual_samples(diagnostic.get("residual_samples", []))
+    compact["diagnostic_residual_sample_summary"] = _compact_lsf_residual_samples(
+        diagnostic.get("diagnostic_residual_samples", []),
+        max_samples=6,
+    )
+    return compact
+
+
+def _compact_lsf_residual_samples(samples: Any, *, max_samples: int = 10) -> dict[str, Any]:
+    if not isinstance(samples, list) or not samples:
+        return {"n_samples": 0, "top_abs_residual_samples": []}
+    rows = [
+        sample
+        for sample in samples
+        if isinstance(sample, dict)
+        and _finite_number(sample.get("velocity_kms"))
+        and _finite_number(sample.get("residual_sigma"))
+    ]
+    rows.sort(key=lambda item: abs(float(item.get("residual_sigma", 0.0))), reverse=True)
+    fields = ("wavelength_A", "velocity_kms", "model_flux", "residual", "residual_sigma", "used_in_fit")
+    return {
+        "n_samples": len(samples),
+        "top_abs_residual_samples": [
+            {key: sample.get(key) for key in fields if key in sample}
+            for sample in rows[: int(max_samples)]
+        ],
     }
 
 

@@ -624,10 +624,22 @@ class LLMInterfaceTest(unittest.TestCase):
             "comparison": "same fitted intrinsic Voigt parameters evaluated after LSF/resolution-matrix convolution",
             "intrinsic_fit_window_metrics": {"fit_rms": 1.4},
             "lsf_fit_window_metrics": {"fit_rms": 1.1},
+            "residual_samples": [
+                {
+                    "wavelength_A": 5575.0 + index,
+                    "velocity_kms": float(index),
+                    "model_flux": 0.9,
+                    "residual": -0.1,
+                    "residual_sigma": float(index - 8),
+                }
+                for index in range(16)
+            ],
         }
 
         messages = build_fit_control_messages(record)
         text = messages[1].content
+        payload = json.loads(text[text.index("{") :])
+        lsf_diagnostic = payload["fit_summary"]["transition_frames"][0]["lsf_diagnostic"]
 
         self.assertIn("lsf", text)
         self.assertIn("lsf_diagnostic", text)
@@ -635,18 +647,26 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertIn("instrument_lsf_applied_to_fit_likelihood", text)
         self.assertIn("intrinsic_fit_window_metrics", text)
         self.assertIn("lsf_fit_window_metrics", text)
+        self.assertIn("residual_sample_summary", lsf_diagnostic)
+        self.assertEqual(lsf_diagnostic["residual_sample_summary"]["n_samples"], 16)
+        self.assertLessEqual(len(lsf_diagnostic["residual_sample_summary"]["top_abs_residual_samples"]), 10)
+        self.assertNotIn("residual_samples", lsf_diagnostic)
 
     def test_fit_control_prompt_includes_soft_doublet_context_and_outlier_policy(self):
         record = self._demo_record()
 
         messages = build_fit_control_messages(record)
         text = messages[1].content
+        payload = json.loads(text[text.index("{") :])
+        context = payload["input"]["line_family_context"]
 
         self.assertIn("line_family_context", text)
+        self.assertEqual(context["ion"], "C IV")
+        self.assertEqual(context["multiplet_type"], "doublet")
+        self.assertIn("outlier_policy", context["soft_background"])
         self.assertIn("soft physical background", text)
         self.assertIn("not an automatic failure", text)
         self.assertIn("Preserve and report single-member", text)
-        self.assertIn("outlier_policy", text)
 
     def test_continuum_changed_carryover_sources_are_soft_position_priors(self):
         original_fit = {
