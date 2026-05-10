@@ -24,6 +24,7 @@ from astroagent.review.packet import (
 )
 from astroagent.review import plot as review_plot
 from astroagent.spectra import voigt_fit
+from astroagent.spectra.voigt_model import apply_lsf_matrix, physical_component_flux_model
 
 
 class ReviewPacketTest(unittest.TestCase):
@@ -241,6 +242,100 @@ class ReviewPacketTest(unittest.TestCase):
             self.assertIn("logN", component["parameter_intervals"])
             self.assertIn("center_prior", component)
 
+    def test_default_fit_reports_lsf_unavailable_without_changing_model_columns(self):
+        spectrum = make_demo_quasar_spectrum(z_sys=2.6, line_id="CIV_doublet")
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="CIV_doublet",
+            z_sys=2.6,
+            sample_id="no_lsf_demo",
+            source={"kind": "unit_test"},
+        )
+        plot_window, _, fit_summary = build_plot_and_fit_data(window, record["input"])
+
+        self.assertFalse(fit_summary["lsf"]["available"])
+        self.assertFalse(fit_summary["instrument_lsf_applied"])
+        self.assertIn("voigt_lsf_model", plot_window.columns)
+        self.assertFalse(plot_window["voigt_lsf_model"].notna().any())
+        for frame in fit_summary["transition_frames"]:
+            self.assertFalse(frame["lsf"]["available"])
+            self.assertFalse(frame["lsf_diagnostic"]["available"])
+
+    def test_lsf_matrix_adds_parallel_diagnostic_without_replacing_intrinsic_fit(self):
+        z_sys = 0.0
+        rest_A = 2796.352
+        wavelength = np.arange(rest_A - 2.0, rest_A + 2.0, 0.08)
+        velocity = (wavelength / rest_A - 1.0) * 299792.458
+        flux = 1.0 - 0.35 * np.exp(-0.5 * (velocity / 16.0) ** 2)
+        spectrum = pd.DataFrame(
+            {
+                "wavelength": wavelength,
+                "flux": flux,
+                "ivar": np.full_like(wavelength, 900.0),
+                "pipeline_mask": np.zeros_like(wavelength, dtype=int),
+            }
+        )
+        record, window = build_review_record(
+            spectrum=spectrum,
+            line_id="MGII_2796",
+            z_sys=z_sys,
+            sample_id="lsf_diagnostic_demo",
+            source={"kind": "unit_test"},
+            half_width_kms=220.0,
+        )
+        frame_size = int(len(window))
+        offsets = np.arange(frame_size)
+        sigma_pix = 1.4
+        lsf_matrix = np.exp(-0.5 * ((offsets[:, None] - offsets[None, :]) / sigma_pix) ** 2)
+        metadata = {
+            **record["input"],
+            "lsf_matrices_by_transition": {"MGII_2796": lsf_matrix.tolist()},
+            "lsf_source": "unit_resolution_matrix",
+        }
+
+        plot_window, _, fit_summary = build_plot_and_fit_data(window, metadata)
+
+        self.assertTrue(fit_summary["lsf"]["available"])
+        self.assertTrue(fit_summary["instrument_lsf_applied"])
+        self.assertFalse(fit_summary["instrument_lsf_applied_to_fit_likelihood"])
+        self.assertEqual(fit_summary["lsf"]["transition_frames_with_lsf"], ["MGII_2796"])
+        frame = fit_summary["transition_frames"][0]
+        self.assertTrue(frame["lsf"]["available"])
+        self.assertFalse(frame["lsf"]["applied_to_fit_likelihood"])
+        self.assertTrue(frame["lsf_diagnostic"]["available"])
+        self.assertIn("intrinsic_fit_window_metrics", frame["lsf_diagnostic"])
+        self.assertIn("lsf_fit_window_metrics", frame["lsf_diagnostic"])
+        self.assertGreater(len(frame["residual_samples"]), 0)
+        self.assertEqual(len(frame["residual_samples"]), len(frame["lsf_diagnostic"]["residual_samples"]))
+        self.assertTrue(plot_window["voigt_model"].notna().any())
+        self.assertTrue(plot_window["voigt_lsf_model"].notna().any())
+        self.assertFalse(
+            np.allclose(
+                plot_window["voigt_model"].dropna().to_numpy(dtype=float),
+                plot_window["voigt_lsf_model"].dropna().to_numpy(dtype=float),
+            )
+        )
+
+    def test_apply_lsf_matrix_preserves_continuum_and_broadens_narrow_absorption(self):
+        velocity = np.linspace(-80.0, 80.0, 81)
+        intrinsic = physical_component_flux_model(
+            velocity,
+            logN=13.2,
+            b_kms=8.0,
+            center_kms=0.0,
+            rest_wavelength_A=2796.352,
+            oscillator_strength=0.6123,
+            damping_gamma_kms=0.001,
+        )
+        pixels = np.arange(len(velocity))
+        matrix = np.exp(-0.5 * ((pixels[:, None] - pixels[None, :]) / 2.0) ** 2)
+
+        convolved = apply_lsf_matrix(intrinsic, matrix)
+
+        self.assertTrue(np.allclose(apply_lsf_matrix(np.ones_like(intrinsic), matrix), 1.0))
+        self.assertGreater(float(np.nanmin(convolved)), float(np.nanmin(intrinsic)))
+        self.assertLess(float(convolved[30]), float(intrinsic[30]))
+
     def test_ultranest_posterior_success_overrides_initializer_failure(self):
         class FailedInitializer:
             success = False
@@ -285,7 +380,7 @@ class ReviewPacketTest(unittest.TestCase):
             ivar = np.full_like(velocity, 900.0)
             seeds = [{"seed_velocity_kms": 0.0, "depth_below_continuum": 0.25, "score": 1.0}]
 
-            fitted, model, fit_mask = voigt_fit._fit_peak_group_once(
+            fitted, model, _lsf_model, fit_mask = voigt_fit._fit_peak_group_once(
                 velocity,
                 flux,
                 ivar,
@@ -341,7 +436,7 @@ class ReviewPacketTest(unittest.TestCase):
             ivar = np.full_like(velocity, 900.0)
             seeds = [{"seed_velocity_kms": 0.0, "depth_below_continuum": 0.25, "score": 1.0}]
 
-            fitted, model, fit_mask = voigt_fit._fit_peak_group_once(
+            fitted, model, _lsf_model, fit_mask = voigt_fit._fit_peak_group_once(
                 velocity,
                 flux,
                 ivar,
@@ -384,7 +479,7 @@ class ReviewPacketTest(unittest.TestCase):
             ivar = np.full_like(velocity, 900.0)
             seeds = [{"seed_velocity_kms": 0.0, "depth_below_continuum": 0.25, "score": 1.0}]
 
-            fitted, model, _fit_mask = voigt_fit._fit_peak_group_once(
+            fitted, model, _lsf_model, _fit_mask = voigt_fit._fit_peak_group_once(
                 velocity,
                 flux,
                 ivar,

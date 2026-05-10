@@ -608,6 +608,34 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertNotIn("map_parameters", text)
         self.assertNotIn("fit_parameter_summary", text)
 
+    def test_fit_control_prompt_includes_lsf_parallel_diagnostic(self):
+        record = self._demo_record()
+        fit_summary = record["fit_results"][0]
+        fit_summary["lsf"] = {
+            "available": True,
+            "applied_to_fit_likelihood": False,
+            "used_for_diagnostic_model": True,
+            "transition_frames_with_lsf": ["CIV_1548"],
+        }
+        fit_summary["instrument_lsf_applied"] = True
+        fit_summary["instrument_lsf_applied_to_fit_likelihood"] = False
+        fit_summary["transition_frames"][0]["lsf_diagnostic"] = {
+            "available": True,
+            "comparison": "same fitted intrinsic Voigt parameters evaluated after LSF/resolution-matrix convolution",
+            "intrinsic_fit_window_metrics": {"fit_rms": 1.4},
+            "lsf_fit_window_metrics": {"fit_rms": 1.1},
+        }
+
+        messages = build_fit_control_messages(record)
+        text = messages[1].content
+
+        self.assertIn("lsf", text)
+        self.assertIn("lsf_diagnostic", text)
+        self.assertIn("applied_to_fit_likelihood", text)
+        self.assertIn("instrument_lsf_applied_to_fit_likelihood", text)
+        self.assertIn("intrinsic_fit_window_metrics", text)
+        self.assertIn("lsf_fit_window_metrics", text)
+
     def test_continuum_changed_carryover_sources_are_soft_position_priors(self):
         original_fit = {
             "components": [

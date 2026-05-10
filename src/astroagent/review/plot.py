@@ -10,7 +10,7 @@ import pandas as pd
 
 from astroagent.agent.policy import SOURCE_WORK_WINDOW_KMS
 from astroagent.review.continuum import C_KMS, _contiguous_intervals, velocity_kms
-from astroagent.spectra.voigt_model import physical_component_flux_model
+from astroagent.spectra.voigt_model import apply_lsf_matrix, physical_component_flux_model
 
 
 def _configure_matplotlib_cache() -> None:
@@ -46,6 +46,7 @@ def build_smooth_voigt_model_data(
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     component_curves: dict[str, list[tuple[int, np.ndarray, np.ndarray]]] = {}
+    lsf_by_transition = _lsf_matrices_by_transition(fit_summary)
     for component in fit_summary.get("components", []):
         if not component.get("fit_success"):
             continue
@@ -98,6 +99,7 @@ def build_smooth_voigt_model_data(
                     "wavelength": float(wave_A),
                     "transition_velocity_kms": float(vel_kms),
                     "smooth_voigt_model": float(model_flux),
+                    "smooth_lsf_model": np.nan,
                     "center_velocity_kms": center_velocity,
                     "center_wavelength_A": center_wavelength,
                     "logN": logN,
@@ -125,10 +127,14 @@ def build_smooth_voigt_model_data(
         for _, velocity, model in curves:
             interp_model = np.interp(velocity_grid, velocity, model, left=1.0, right=1.0)
             total_model *= np.clip(interp_model, 0.0, 1.5)
+        lsf_model = np.full_like(total_model, np.nan, dtype=float)
+        lsf_matrix = _resample_lsf_matrix(lsf_by_transition.get(transition_line_id), len(total_model))
+        if lsf_matrix is not None:
+            lsf_model = apply_lsf_matrix(total_model, lsf_matrix)
 
         observed_center_A = float(frame.get("observed_center_A", np.nan))
         wavelength = observed_center_A * (1.0 + velocity_grid / C_KMS) if np.isfinite(observed_center_A) else np.full_like(velocity_grid, np.nan)
-        for wave_A, vel_kms, model_flux in zip(wavelength, velocity_grid, total_model, strict=True):
+        for wave_A, vel_kms, model_flux, lsf_flux in zip(wavelength, velocity_grid, total_model, lsf_model, strict=True):
             rows.append(
                 {
                     "curve_kind": "combined",
@@ -137,6 +143,7 @@ def build_smooth_voigt_model_data(
                     "wavelength": float(wave_A),
                     "transition_velocity_kms": float(vel_kms),
                     "smooth_voigt_model": float(model_flux),
+                    "smooth_lsf_model": float(lsf_flux) if np.isfinite(lsf_flux) else np.nan,
                     "center_velocity_kms": np.nan,
                     "center_wavelength_A": np.nan,
                     "logN": np.nan,
@@ -152,6 +159,7 @@ def build_smooth_voigt_model_data(
         "wavelength",
         "transition_velocity_kms",
         "smooth_voigt_model",
+        "smooth_lsf_model",
         "center_velocity_kms",
         "center_wavelength_A",
         "logN",
@@ -159,6 +167,30 @@ def build_smooth_voigt_model_data(
         "damping_gamma_kms",
     ]
     return pd.DataFrame(rows, columns=columns)
+
+
+def _lsf_matrices_by_transition(fit_summary: dict[str, Any]) -> dict[str, np.ndarray]:
+    raw = fit_summary.get("lsf_matrices_by_transition", fit_summary.get("lsf_matrices", {}))
+    if not isinstance(raw, dict):
+        return {}
+    matrices: dict[str, np.ndarray] = {}
+    for transition_line_id, matrix in raw.items():
+        try:
+            parsed = np.asarray(matrix, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if parsed.ndim == 2 and parsed.shape[0] == parsed.shape[1]:
+            matrices[str(transition_line_id)] = parsed
+    return matrices
+
+
+def _resample_lsf_matrix(matrix: np.ndarray | None, n_pixels: int) -> np.ndarray | None:
+    if matrix is None:
+        return None
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.shape == (int(n_pixels), int(n_pixels)):
+        return matrix
+    return None
 
 
 def _component_posterior_band(

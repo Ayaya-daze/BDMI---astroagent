@@ -528,8 +528,11 @@ def _plot_data_record(sample_id: str, plot_summary: dict[str, Any], fit_summary:
             "is_continuum_pixel",
             "is_continuum_excluded_pixel",
             "voigt_model",
+            "voigt_lsf_model",
             "voigt_residual",
+            "voigt_lsf_residual",
             "voigt_residual_sigma",
+            "voigt_lsf_residual_sigma",
             "is_voigt_fit_pixel",
             "voigt_component_index",
             "voigt_transition_id",
@@ -542,6 +545,7 @@ def _plot_data_record(sample_id: str, plot_summary: dict[str, Any], fit_summary:
             "wavelength",
             "transition_velocity_kms",
             "smooth_voigt_model",
+            "smooth_lsf_model",
             "center_velocity_kms",
             "center_wavelength_A",
             "logN",
@@ -627,8 +631,11 @@ def _apply_fit_summary_to_plot_window(plot_window: pd.DataFrame, fit_summary: di
     """
     output = plot_window.copy()
     output["voigt_model"] = np.nan
+    output["voigt_lsf_model"] = np.nan
     output["voigt_residual"] = np.nan
+    output["voigt_lsf_residual"] = np.nan
     output["voigt_residual_sigma"] = np.nan
+    output["voigt_lsf_residual_sigma"] = np.nan
     output["is_voigt_fit_pixel"] = 0
     output["voigt_component_index"] = -1
     output["voigt_transition_id"] = ""
@@ -666,6 +673,17 @@ def _apply_fit_summary_to_plot_window(plot_window: pd.DataFrame, fit_summary: di
             left=np.nan,
             right=np.nan,
         )
+        lsf_model = (
+            np.interp(
+                velocity[frame_mask],
+                combined_rows["transition_velocity_kms"].to_numpy(dtype=float),
+                combined_rows["smooth_lsf_model"].to_numpy(dtype=float),
+                left=np.nan,
+                right=np.nan,
+            )
+            if "smooth_lsf_model" in combined_rows.columns
+            else np.full_like(model, np.nan, dtype=float)
+        )
         frame_indices = np.flatnonzero(frame_mask)
         finite_model = np.isfinite(model)
         target_indices = frame_indices[finite_model]
@@ -676,15 +694,27 @@ def _apply_fit_summary_to_plot_window(plot_window: pd.DataFrame, fit_summary: di
             np.minimum(existing, updated_model),
             updated_model,
         )
+        finite_lsf_model = np.isfinite(lsf_model)
+        lsf_target_indices = frame_indices[finite_lsf_model]
+        existing_lsf = output.loc[lsf_target_indices, "voigt_lsf_model"].to_numpy(dtype=float)
+        updated_lsf_model = lsf_model[finite_lsf_model]
+        output.loc[lsf_target_indices, "voigt_lsf_model"] = np.where(
+            np.isfinite(existing_lsf),
+            np.minimum(existing_lsf, updated_lsf_model),
+            updated_lsf_model,
+        )
         output.loc[frame_indices, "voigt_transition_id"] = transition_line_id
         output.loc[frame_indices, "transition_velocity_kms"] = velocity[frame_mask]
 
     finite = np.isfinite(output["voigt_model"].to_numpy(dtype=float))
     output.loc[finite, "is_voigt_fit_pixel"] = 1
     output.loc[finite, "voigt_residual"] = normalized_flux[finite] - output.loc[finite, "voigt_model"].to_numpy(dtype=float)
+    finite_lsf = np.isfinite(output["voigt_lsf_model"].to_numpy(dtype=float))
+    output.loc[finite_lsf, "voigt_lsf_residual"] = normalized_flux[finite_lsf] - output.loc[finite_lsf, "voigt_lsf_model"].to_numpy(dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
         err = np.where(normalized_ivar > 0.0, 1.0 / np.sqrt(normalized_ivar), np.nan)
     output.loc[finite, "voigt_residual_sigma"] = output.loc[finite, "voigt_residual"].to_numpy(dtype=float) / err[finite]
+    output.loc[finite_lsf, "voigt_lsf_residual_sigma"] = output.loc[finite_lsf, "voigt_lsf_residual"].to_numpy(dtype=float) / err[finite_lsf]
 
     for component in fit_summary.get("components", []):
         transition_line_id = str(component.get("transition_line_id", ""))
@@ -711,7 +741,7 @@ def _review_packet_readme() -> str:
             "- `*.review.json`：一条结构化样本，留给人工审查和修正。",
             "- `*.window.csv`：局域观测波长谱窗。",
             "- `*.plot.csv`：画图专用数据，包含连续谱拟合和归一化谱。",
-            "- `*.model.csv`：速度空间平滑 Voigt 曲线，`component` 是单峰，`combined` 是同一 transition 内的总模型。",
+            "- `*.model.csv`：速度空间平滑 Voigt 曲线，`component` 是单峰，`combined` 是同一 transition 内的总模型；有 LSF 时会保留 LSF 诊断列。",
             "- `*.overview.png`：观测波长空间的局域窗口总览图，显示 raw flux、continuum、normalized flux 和 transition centers。",
             "- `*.plot.png`：每条 transition 一个局部速度坐标子图。",
             "",

@@ -14,6 +14,7 @@ from astroagent.agent.policy import SOURCE_WORK_WINDOW_KMS
 from astroagent.spectra.line_catalog import load_line_catalog, transition_definitions
 from astroagent.spectra.peak_detection import detect_absorption_peaks
 from astroagent.spectra.voigt_model import (
+    apply_lsf_matrix,
     column_density_to_tau_scale,
     combined_physical_flux_model,
     physical_component_flux_model,
@@ -51,6 +52,9 @@ def _prepare_arrays(plot_window: pd.DataFrame) -> dict[str, np.ndarray]:
 
 def _empty_model_columns(output: pd.DataFrame) -> pd.DataFrame:
     output["voigt_model"] = np.nan
+    output["voigt_lsf_model"] = np.nan
+    output["voigt_lsf_residual"] = np.nan
+    output["voigt_lsf_residual_sigma"] = np.nan
     output["voigt_residual"] = np.nan
     output["voigt_residual_sigma"] = np.nan
     output["is_voigt_fit_pixel"] = 0
@@ -71,10 +75,11 @@ def _fit_peak_group(
     rest_wavelength_A: float,
     oscillator_strength: float,
     damping_gamma_kms: float,
+    lsf_matrix: np.ndarray | None = None,
     merge_separation_kms: float = 70.0,
-) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
+) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray, np.ndarray]:
     if not seeds:
-        return [], np.full(len(velocity), np.nan, dtype=float), np.zeros(len(velocity), dtype=bool)
+        return [], np.full(len(velocity), np.nan, dtype=float), np.full(len(velocity), np.nan, dtype=float), np.zeros(len(velocity), dtype=bool)
 
     seed_duplicates: set[int] = set()
     close_seed_merge_separation_kms = min(15.0, 0.25 * merge_separation_kms)
@@ -113,9 +118,10 @@ def _fit_peak_group(
             }
             for seed in seeds
         ]
-        return failed, np.full(len(velocity), np.nan, dtype=float), fit_mask
+        empty_model = np.full(len(velocity), np.nan, dtype=float)
+        return failed, empty_model, empty_model.copy(), fit_mask
 
-    fitted, model_local, fit_mask = _fit_peak_group_once(
+    fitted, model_local, lsf_model_local, fit_mask = _fit_peak_group_once(
         velocity,
         flux,
         ivar,
@@ -126,6 +132,7 @@ def _fit_peak_group(
         rest_wavelength_A=rest_wavelength_A,
         oscillator_strength=oscillator_strength,
         damping_gamma_kms=damping_gamma_kms,
+        lsf_matrix=lsf_matrix,
     )
     successful = [peak for peak in fitted if peak.get("fit_success")]
     centers = [float(peak.get("center_velocity_kms", np.nan)) for peak in successful]
@@ -146,7 +153,7 @@ def _fit_peak_group(
 
     if duplicates and len(seeds) - len(duplicates) >= 1:
         reduced_seeds = [seed for index, seed in enumerate(seeds) if index not in duplicates]
-        fitted, model_local, fit_mask = _fit_peak_group_once(
+        fitted, model_local, lsf_model_local, fit_mask = _fit_peak_group_once(
             velocity,
             flux,
             ivar,
@@ -157,11 +164,12 @@ def _fit_peak_group(
             rest_wavelength_A=rest_wavelength_A,
             oscillator_strength=oscillator_strength,
             damping_gamma_kms=damping_gamma_kms,
+            lsf_matrix=lsf_matrix,
         )
         for peak in fitted:
             peak["duplicate_merge_applied"] = True
 
-    return fitted, model_local, fit_mask
+    return fitted, model_local, lsf_model_local, fit_mask
 
 
 def _run_ultranest_physical_posterior(
@@ -474,7 +482,8 @@ def _fit_peak_group_once(
     rest_wavelength_A: float,
     oscillator_strength: float,
     damping_gamma_kms: float,
-) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
+    lsf_matrix: np.ndarray | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray, np.ndarray]:
     evaluation_mask = np.isfinite(velocity)
     vel_fit = velocity[fit_mask]
     flux_fit = flux[fit_mask]
@@ -605,13 +614,16 @@ def _fit_peak_group_once(
                     "parameter_estimator": "none_posterior_unavailable",
                     "fit_pixel_mask_local": fit_mask,
                     "model_local": np.full(len(velocity), np.nan, dtype=float),
+                    "lsf_model_local": np.full(len(velocity), np.nan, dtype=float),
                     "combined_model_local": np.full(len(velocity), np.nan, dtype=float),
+                    "combined_lsf_model_local": np.full(len(velocity), np.nan, dtype=float),
                     "diagnostic_flags": ["bayesian_posterior_unavailable"],
                     "diagnostic_warnings": ["least-squares MAP is not used as a public fit result"],
                     "diagnostic_details": {"posterior_backend": parameter_summary.get("backend")},
                 }
             )
-        return failed, np.full(len(velocity), np.nan, dtype=float), fit_mask
+        empty_model = np.full(len(velocity), np.nan, dtype=float)
+        return failed, empty_model, empty_model.copy(), fit_mask
     combined_fit = model_for(params, vel_fit)
     norm_residual = (flux_fit - combined_fit) / err_fit
     chi2 = float(np.sum(np.square(norm_residual)))
@@ -621,6 +633,9 @@ def _fit_peak_group_once(
 
     combined_model_local = np.full(len(velocity), np.nan, dtype=float)
     combined_model_local[evaluation_mask] = model_for(params, velocity[evaluation_mask])
+    combined_lsf_model_local = np.full(len(velocity), np.nan, dtype=float)
+    if lsf_matrix is not None:
+        combined_lsf_model_local[evaluation_mask] = apply_lsf_matrix(combined_model_local[evaluation_mask], lsf_matrix)
 
     fitted: list[dict[str, Any]] = []
     for index, seed in enumerate(seeds):
@@ -641,6 +656,9 @@ def _fit_peak_group_once(
             oscillator_strength=oscillator_strength,
             damping_gamma_kms=damping_gamma_kms,
         )
+        lsf_component_model_local = np.full(len(velocity), np.nan, dtype=float)
+        if lsf_matrix is not None:
+            lsf_component_model_local[evaluation_mask] = apply_lsf_matrix(component_model_local[evaluation_mask], lsf_matrix)
         ew_half_width = max(float(local_fit_half_width_kms), 6.0 * b_kms)
         fine_velocity = np.linspace(center_kms - ew_half_width, center_kms + ew_half_width, 1000)
         fine_model = physical_component_flux_model(
@@ -785,20 +803,24 @@ def _fit_peak_group_once(
                 "equivalent_width_velocity_kms": equivalent_width_velocity_kms,
                 "fit_pixel_mask_local": fit_mask,
                 "model_local": component_model_local,
+                "lsf_model_local": lsf_component_model_local,
                 "combined_model_local": combined_model_local,
+                "combined_lsf_model_local": combined_lsf_model_local,
                 "diagnostic_flags": sorted(set(diagnostic_flags)),
                 "diagnostic_warnings": sorted(set(diagnostic_warnings)),
                 "diagnostic_details": diagnostic_details,
             }
         )
-    return fitted, combined_model_local, fit_mask
+    return fitted, combined_model_local, combined_lsf_model_local, fit_mask
 
 
 def _public_peak(peak: dict[str, Any]) -> dict[str, Any]:
     private = {
         "fit_pixel_mask_local",
         "model_local",
+        "lsf_model_local",
         "combined_model_local",
+        "combined_lsf_model_local",
         "_seed_order",
         "map_parameters",
         "fit_parameter_summary",
@@ -887,8 +909,11 @@ def fit_voigt_absorption(
 
     catalog = load_line_catalog(metadata.get("catalog_path"))
     transitions = transition_definitions(line_id, catalog)
+    lsf_by_transition = _lsf_matrices_by_transition(metadata)
+    lsf_available = bool(lsf_by_transition)
     transition_frames: list[dict[str, Any]] = []
     global_model = np.full(len(output), np.nan, dtype=float)
+    global_lsf_model = np.full(len(output), np.nan, dtype=float)
     global_fit_mask = np.zeros(len(output), dtype=bool)
     frame_fit_residuals: list[np.ndarray] = []
     frame_work_residuals: list[np.ndarray] = []
@@ -953,6 +978,14 @@ def fit_voigt_absorption(
             "sibling_transition_masks": sibling_intervals,
             "peaks": [],
         }
+        frame_lsf_matrix = _validated_frame_lsf_matrix(lsf_by_transition.get(transition_line_id), int(frame_mask.sum()))
+        frame_record["lsf"] = {
+            "available": bool(frame_lsf_matrix is not None),
+            "applied_to_fit_likelihood": False,
+            "used_for_diagnostic_model": bool(frame_lsf_matrix is not None),
+            "source": _lsf_source(metadata, transition_line_id) if frame_lsf_matrix is not None else "not_available",
+        }
+        frame_record["lsf_diagnostic"] = _lsf_frame_diagnostic([], [], [])
         if int(fit_good.sum()) < 8:
             frame_record.update(
                 {
@@ -999,6 +1032,11 @@ def fit_voigt_absorption(
         fit_good_local = fit_good[frame_mask]
         if not seeds:
             null_model_local = np.ones_like(frame_flux, dtype=float)
+            null_lsf_model_local = (
+                apply_lsf_matrix(null_model_local, frame_lsf_matrix)
+                if frame_lsf_matrix is not None
+                else np.full_like(frame_flux, np.nan, dtype=float)
+            )
             null_fit_mask = fit_good_local & np.isfinite(frame_flux) & np.isfinite(frame_ivar) & (frame_ivar > 0.0)
             if null_fit_mask.any():
                 global_fit_mask[frame_indices[null_fit_mask]] = True
@@ -1009,6 +1047,13 @@ def fit_voigt_absorption(
                     global_model[target_indices[~fill]],
                     null_model_local[null_fit_mask][~fill],
                 )
+                if frame_lsf_matrix is not None:
+                    fill_lsf = ~np.isfinite(global_lsf_model[target_indices])
+                    global_lsf_model[target_indices[fill_lsf]] = null_lsf_model_local[null_fit_mask][fill_lsf]
+                    global_lsf_model[target_indices[~fill_lsf]] = np.minimum(
+                        global_lsf_model[target_indices[~fill_lsf]],
+                        null_lsf_model_local[null_fit_mask][~fill_lsf],
+                    )
             residual_samples = _frame_residual_samples(
                 wavelength[frame_mask],
                 frame_velocity,
@@ -1025,6 +1070,31 @@ def fit_voigt_absorption(
                 null_model_local,
                 frame_good_local & np.isfinite(frame_flux) & np.isfinite(frame_ivar) & (frame_ivar > 0.0),
                 null_fit_mask,
+            )
+            lsf_residual_samples = (
+                _frame_residual_samples(
+                    wavelength[frame_mask],
+                    frame_velocity,
+                    frame_flux,
+                    frame_ivar,
+                    null_lsf_model_local,
+                    null_fit_mask,
+                )
+                if frame_lsf_matrix is not None
+                else []
+            )
+            lsf_diagnostic_residual_samples = (
+                _frame_diagnostic_residual_samples(
+                    wavelength[frame_mask],
+                    frame_velocity,
+                    frame_flux,
+                    frame_ivar,
+                    null_lsf_model_local,
+                    frame_good_local & np.isfinite(frame_flux) & np.isfinite(frame_ivar) & (frame_ivar > 0.0),
+                    null_fit_mask,
+                )
+                if frame_lsf_matrix is not None
+                else []
             )
             _append_frame_residuals(residual_samples, frame_fit_residuals, frame_work_residuals)
             frame_residual_metrics = _residual_metrics_from_samples(residual_samples)
@@ -1052,13 +1122,18 @@ def fit_voigt_absorption(
                     "residual_model": "flat_no_source_model",
                     "residual_samples": residual_samples,
                     "diagnostic_residual_samples": diagnostic_residual_samples,
+                    "lsf_diagnostic": _lsf_frame_diagnostic(
+                        residual_samples,
+                        lsf_residual_samples,
+                        lsf_diagnostic_residual_samples,
+                    ),
                 }
             )
             review_reasons.extend(frame_record["agent_review_reasons"])
             transition_frames.append(frame_record)
             continue
 
-        fitted_peaks, combined_model_local, combined_fit_mask = _fit_peak_group(
+        fitted_peaks, combined_model_local, combined_lsf_model_local, combined_fit_mask = _fit_peak_group(
             frame_velocity,
             frame_flux,
             frame_ivar,
@@ -1069,6 +1144,7 @@ def fit_voigt_absorption(
             rest_wavelength_A=rest_A,
             oscillator_strength=oscillator_strength,
             damping_gamma_kms=damping_gamma_kms,
+            lsf_matrix=frame_lsf_matrix,
             merge_separation_kms=0.70 * min_peak_separation_kms,
         )
         combined_finite = np.isfinite(combined_model_local)
@@ -1078,6 +1154,13 @@ def fit_voigt_absorption(
             fill = ~np.isfinite(global_model[full_indices])
             global_model[full_indices[fill]] = full_model[fill]
             global_model[full_indices[~fill]] = np.minimum(global_model[full_indices[~fill]], full_model[~fill])
+        lsf_finite = np.isfinite(combined_lsf_model_local)
+        if lsf_finite.any():
+            full_indices = frame_indices[lsf_finite]
+            full_model = combined_lsf_model_local[lsf_finite]
+            fill = ~np.isfinite(global_lsf_model[full_indices])
+            global_lsf_model[full_indices[fill]] = full_model[fill]
+            global_lsf_model[full_indices[~fill]] = np.minimum(global_lsf_model[full_indices[~fill]], full_model[~fill])
         if combined_fit_mask.any():
             global_fit_mask[frame_indices[combined_fit_mask]] = True
         residual_samples = _frame_residual_samples(
@@ -1096,6 +1179,31 @@ def fit_voigt_absorption(
             combined_model_local,
             frame_good_local,
             combined_fit_mask,
+        )
+        lsf_residual_samples = (
+            _frame_residual_samples(
+                wavelength[frame_mask],
+                frame_velocity,
+                frame_flux,
+                frame_ivar,
+                combined_lsf_model_local,
+                combined_fit_mask,
+            )
+            if frame_lsf_matrix is not None
+            else []
+        )
+        lsf_diagnostic_residual_samples = (
+            _frame_diagnostic_residual_samples(
+                wavelength[frame_mask],
+                frame_velocity,
+                frame_flux,
+                frame_ivar,
+                combined_lsf_model_local,
+                frame_good_local,
+                combined_fit_mask,
+            )
+            if frame_lsf_matrix is not None
+            else []
         )
         _append_frame_residuals(residual_samples, frame_fit_residuals, frame_work_residuals)
         frame_residual_metrics = _residual_metrics_from_samples(residual_samples)
@@ -1140,12 +1248,21 @@ def fit_voigt_absorption(
                 "source_work_window_metrics": frame_work_metrics,
                 "residual_samples": residual_samples,
                 "diagnostic_residual_samples": diagnostic_residual_samples,
+                "lsf_diagnostic": _lsf_frame_diagnostic(
+                    residual_samples,
+                    lsf_residual_samples,
+                    lsf_diagnostic_residual_samples,
+                ),
                 "peaks": [_public_peak(peak) for peak in fitted_peaks],
             }
         )
         transition_frames.append(frame_record)
 
     output["voigt_model"] = global_model
+    output["voigt_lsf_model"] = global_lsf_model
+    output["voigt_lsf_residual"] = np.nan
+    output.loc[global_fit_mask, "voigt_lsf_residual"] = normalized_flux[global_fit_mask] - global_lsf_model[global_fit_mask]
+    output["voigt_lsf_residual_sigma"] = np.nan
     output["voigt_residual"] = np.nan
     output.loc[global_fit_mask, "voigt_residual"] = normalized_flux[global_fit_mask] - global_model[global_fit_mask]
     output["voigt_residual_sigma"] = np.nan
@@ -1153,6 +1270,9 @@ def fit_voigt_absorption(
         err_all = np.where(normalized_ivar > 0.0, 1.0 / np.sqrt(normalized_ivar), np.nan)
     output.loc[global_fit_mask, "voigt_residual_sigma"] = (
         normalized_flux[global_fit_mask] - global_model[global_fit_mask]
+    ) / err_all[global_fit_mask]
+    output.loc[global_fit_mask, "voigt_lsf_residual_sigma"] = (
+        normalized_flux[global_fit_mask] - global_lsf_model[global_fit_mask]
     ) / err_all[global_fit_mask]
     output["is_voigt_fit_pixel"] = global_fit_mask.astype(int)
 
@@ -1186,6 +1306,7 @@ def fit_voigt_absorption(
         reduced_chi2 = float("nan")
         fit_rms = float("nan")
     work_window_metrics = _source_work_window_metrics_from_residuals(frame_work_residuals)
+    lsf_summary = _lsf_summary(transition_frames, lsf_available)
 
     unique_review_reasons = sorted(set(review_reasons))
     success = any(frame.get("success") for frame in transition_frames)
@@ -1202,6 +1323,10 @@ def fit_voigt_absorption(
         "fit_backends": fit_backends,
         "fit_model": "per_transition_multi_component_physical_voigt",
         "model_equation": "normalized_flux = product_i VoigtFlux(logN_i, b_i, v_i; transition rest_A, f, gamma)",
+        "lsf": lsf_summary,
+        "instrument_lsf_applied": bool(lsf_summary["available"]),
+        "instrument_lsf_applied_to_fit_likelihood": False,
+        "lsf_model_policy": "primary fit likelihood remains intrinsic Voigt; LSF-convolved model is reported as a parallel diagnostic when a per-frame matrix is provided",
         "success": bool(success),
         "status": status,
         "quality": quality,
@@ -1234,8 +1359,11 @@ def fit_voigt_absorption(
         "fit_control_applied": _fit_control_summary(controls),
         "model_columns": [
             "voigt_model",
+            "voigt_lsf_model",
             "voigt_residual",
+            "voigt_lsf_residual",
             "voigt_residual_sigma",
+            "voigt_lsf_residual_sigma",
             "is_voigt_fit_pixel",
             "voigt_component_index",
             "voigt_transition_id",
@@ -1255,6 +1383,93 @@ def _failed_summary(reason: str) -> dict[str, Any]:
         "metadata_use": "line_id and z_sys define transition frames only",
         "transition_frames": [],
     }
+
+
+def _lsf_matrices_by_transition(metadata: dict[str, Any]) -> dict[str, np.ndarray]:
+    raw = metadata.get("lsf_matrices_by_transition", metadata.get("lsf_matrices", {}))
+    if not isinstance(raw, dict):
+        return {}
+    matrices: dict[str, np.ndarray] = {}
+    for transition_line_id, matrix in raw.items():
+        try:
+            parsed = np.asarray(matrix, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if parsed.ndim == 2:
+            matrices[str(transition_line_id)] = parsed
+    return matrices
+
+
+def _validated_frame_lsf_matrix(matrix: np.ndarray | None, n_pixels: int) -> np.ndarray | None:
+    if matrix is None:
+        return None
+    parsed = np.asarray(matrix, dtype=float)
+    if parsed.shape != (int(n_pixels), int(n_pixels)):
+        return None
+    if not np.isfinite(parsed).all():
+        return None
+    return parsed
+
+
+def _lsf_source(metadata: dict[str, Any], transition_line_id: str) -> str:
+    sources = metadata.get("lsf_sources_by_transition", metadata.get("lsf_source_by_transition", {}))
+    if isinstance(sources, dict) and transition_line_id in sources:
+        return str(sources[transition_line_id])
+    return str(metadata.get("lsf_source", "metadata_lsf_matrix"))
+
+
+def _lsf_frame_diagnostic(
+    intrinsic_residual_samples: list[dict[str, float]],
+    lsf_residual_samples: list[dict[str, float]],
+    lsf_diagnostic_residual_samples: list[dict[str, float]],
+) -> dict[str, Any]:
+    if not lsf_residual_samples:
+        return {
+            "available": False,
+            "comparison": "no LSF matrix supplied for this transition frame",
+        }
+    intrinsic_metrics = _residual_metrics_from_samples(intrinsic_residual_samples)
+    lsf_metrics = _residual_metrics_from_samples(lsf_residual_samples)
+    return {
+        "available": True,
+        "comparison": "same fitted intrinsic Voigt parameters evaluated after LSF/resolution-matrix convolution",
+        "intrinsic_fit_window_metrics": intrinsic_metrics,
+        "lsf_fit_window_metrics": lsf_metrics,
+        "delta_fit_rms": _finite_delta(lsf_metrics.get("fit_rms"), intrinsic_metrics.get("fit_rms")),
+        "delta_reduced_chi2": _finite_delta(lsf_metrics.get("reduced_chi2"), intrinsic_metrics.get("reduced_chi2")),
+        "residual_samples": lsf_residual_samples,
+        "diagnostic_residual_samples": lsf_diagnostic_residual_samples,
+    }
+
+
+def _lsf_summary(transition_frames: list[dict[str, Any]], lsf_supplied: bool) -> dict[str, Any]:
+    available_frames = [
+        str(frame.get("transition_line_id"))
+        for frame in transition_frames
+        if frame.get("lsf", {}).get("available")
+    ]
+    return {
+        "available": bool(available_frames),
+        "supplied": bool(lsf_supplied),
+        "applied_to_fit_likelihood": False,
+        "used_for_diagnostic_model": bool(available_frames),
+        "transition_frames_with_lsf": available_frames,
+        "policy": (
+            "The public fitted parameters are from the intrinsic Voigt likelihood. "
+            "When an LSF matrix is available, the same parameters are also evaluated after LSF convolution for LLM review."
+        ),
+    }
+
+
+def _finite_delta(left: Any, right: Any) -> float | None:
+    try:
+        left_value = float(left)
+        right_value = float(right)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(left_value) or not np.isfinite(right_value):
+        return None
+    return float(left_value - right_value)
 
 
 def _sibling_transition_intervals(

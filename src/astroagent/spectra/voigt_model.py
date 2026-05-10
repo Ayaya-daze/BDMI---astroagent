@@ -54,6 +54,25 @@ def physical_component_flux_model(
     return covering * covered_flux + (1.0 - covering)
 
 
+def apply_lsf_matrix(
+    flux_model: np.ndarray,
+    lsf_matrix: np.ndarray | None,
+) -> np.ndarray:
+    """Apply an instrument LSF/resolution matrix to a model on the same grid."""
+    model = np.asarray(flux_model, dtype=float)
+    if lsf_matrix is None:
+        return model.copy()
+    matrix = np.asarray(lsf_matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape != (len(model), len(model)):
+        raise ValueError(f"LSF matrix shape {matrix.shape} is incompatible with model length {len(model)}")
+    finite_model = np.where(np.isfinite(model), model, 1.0)
+    convolved = matrix @ finite_model
+    row_sum = matrix @ np.ones_like(finite_model)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        convolved = np.divide(convolved, row_sum, out=np.full_like(convolved, np.nan), where=row_sum > 0.0)
+    return convolved
+
+
 def combined_physical_flux_model(
     velocity_kms: np.ndarray,
     params: np.ndarray,
@@ -61,6 +80,7 @@ def combined_physical_flux_model(
     rest_wavelength_A: float,
     oscillator_strength: float,
     damping_gamma_kms: float,
+    lsf_matrix: np.ndarray | None = None,
 ) -> np.ndarray:
     """Product of all physical Voigt components in one transition frame."""
     velocity = np.asarray(velocity_kms, dtype=float)
@@ -78,7 +98,7 @@ def combined_physical_flux_model(
             oscillator_strength=oscillator_strength,
             damping_gamma_kms=damping_gamma_kms,
         )
-    return model
+    return apply_lsf_matrix(model, lsf_matrix)
 
 
 def normalized_voigt_velocity(
@@ -119,4 +139,3 @@ def component_optical_depth_model(
     """Legacy toy-model helper kept for old fixtures only."""
     tau = float(tau0) * normalized_voigt_velocity(velocity_kms, center_kms, sigma_kms, gamma_kms)
     return np.exp(-np.clip(tau, 0.0, 80.0))
-
