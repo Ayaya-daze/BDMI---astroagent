@@ -9,6 +9,49 @@
 
 当前的设计重点是“多轮探索 + gate + 人工兜底”，不是“模型一票否决”。模型可以在一轮里同时提出多个 source、window 和 mask 编辑；如果 refit 后没有明显退化但仍然不够稳，结果会被保留并转为 `needs_human_review`，而不是直接当作失败丢掉。
 
+## 传给 LLM 的物理上下文
+
+`review.json` 的 `input.line_family_context` 是来自 `configs/line_catalog.json` 的软背景知识，不是硬过滤规则。它包含：
+
+- `ion`、`family`、`multiplet_type`
+- `transition_line_ids`
+- `oscillator_strengths` / `oscillator_strength_ratio`
+- `soft_background.summary`
+- `soft_background.expected_relation`
+- `soft_background.outlier_policy`
+- `soft_background.agent_guidance`
+
+对 C IV / Mg II doublet，LLM 会被告知：相近 velocity 的 sibling transition 结构是 absorber 解释的支持证据；未饱和干净吸收中强线通常更深，饱和时强弱比可能接近 1:1。但这不是自动验收或自动剔除规则。单成员特征、sibling 不一致、强弱比异常都要保留并报告，可能对应 blend、污染、bad pixels、低 S/N、饱和、谱窗边缘效应或真实模糊样本。LLM 不应仅因为另一个 panel 弱或缺失就删除 source 或加 mask。
+
+每个 `transition_frame` 也会带 `ion`、`partner_line_id` 和 `family_context`，帮助模型理解 velocity-frame 图之间的关系。
+
+## LSF 诊断边界
+
+当前主拟合仍是 intrinsic physical Voigt posterior：公开参数、主 `voigt_model`、主 residual 和 gate 指标来自没有 LSF 卷积的 posterior median 模型。这样避免在没有真实 LSF 时用猜测的 Gaussian/常数分辨率污染参数。
+
+如果输入 metadata 提供 per-transition LSF/resolution matrix：
+
+```json
+{
+  "lsf_matrices_by_transition": {
+    "MGII_2796": [[...], "..."]
+  },
+  "lsf_source": "desi_resolution_matrix"
+}
+```
+
+拟合器会额外计算同一组 intrinsic posterior 参数经过 LSF matrix 后的观测空间模型，并写入并列诊断：
+
+- `fit_results[0].lsf`
+- `fit_results[0].instrument_lsf_applied`
+- `fit_results[0].instrument_lsf_applied_to_fit_likelihood`
+- `transition_frames[].lsf`
+- `transition_frames[].lsf_diagnostic`
+- `plot.csv` 的 `voigt_lsf_model`、`voigt_lsf_residual`、`voigt_lsf_residual_sigma`
+- `model.csv` 的 `smooth_lsf_model`
+
+`instrument_lsf_applied_to_fit_likelihood` 当前固定为 `false`。也就是说，LSF 结果是给 LLM 和人工看的对照诊断，不替代主拟合参数。LLM 应比较 intrinsic residual 与 LSF residual 后再决定是否继续实验或转人工。
+
 ## 当前开发切片
 
 - `src/astroagent/agent/llm.py`
@@ -34,6 +77,7 @@
   - least-squares / MAP 只允许作为 initializer 和诊断参考；不能填充 public model、residual、component 参数或 posterior interval。
   - 如果 UltraNest posterior 不可用、不完整，或缺少任一组件参数 median，这个 transition fit 会标记为 posterior unavailable，并进入 review，而不是回退到 initializer。
   - posterior band 只根据实际 q16/median/q84 绘制；不会人为加最小宽度来制造不确定性。
+  - 如果 metadata 提供 per-transition LSF matrix，会额外输出 LSF-convolved model/residual 诊断；主 likelihood 和 public parameters 仍保持 intrinsic Voigt。
 - `src/astroagent/agent/loop.py`
   - 编排有界多轮 loop：`run_fit_control -> build_fit_control_patch -> refit_record_with_overrides -> write_review_packet`。
   - 不重新实现 provider、tool schema、patch normalization 或 refit gate，只保存每轮 `control_status`、tool 数、gate decision、是否推进到下一轮。

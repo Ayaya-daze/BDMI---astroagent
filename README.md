@@ -34,6 +34,7 @@
 - 速度坐标转换
 - 窗口质量摘要
 - line-family 元数据和审查字段；C IV / Mg II 只是第一批验证样例，不代表项目只做 doublet
+- line-family 软背景知识：doublet/multiplet 一致性只作为支持证据，单成员或不一致特征必须保留并报告为 outlier/ambiguous case
 - 第一层拟合草案：每条 transition 自己建 velocity frame，拟合多个吸收峰
 - 第二层分析接口骨架：后续让 agent 判断同源关系、blend、结构和人工复核需求
 - Task A 的 rule baseline：analysis mask 和 continuum anchors
@@ -42,6 +43,7 @@
 - 人工裁决字段：保留最终科学判断给人
 - JSON/CSV 审查包输出
 - ABSpec 风格诊断图：每条 transition 一个速度空间子图，观测谱用 step，模型用平滑 Voigt component/combined 曲线
+- LSF 诊断接口：主拟合仍使用 intrinsic Voigt posterior；只有输入提供 per-transition LSF/resolution matrix 时，额外输出 LSF-convolved model/residual 供 LLM 和人工对照
 - LLM 接口骨架：支持离线 client 和 OpenAI-compatible chat completions；有界多轮 agent loop 已接入，策略和评测仍在迭代
 
 最近已经用真实脏数据跑过一批小实验，包括本地 `srt/data` 里的 COS/HI 样本。结论是：数据处理层和 loop 脚手架已经能工作，但具体样本是否继续探索、是否转人工，仍然依赖 gate 和后续模型判断。

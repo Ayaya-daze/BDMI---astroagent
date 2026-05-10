@@ -80,12 +80,16 @@ outputs/
 line catalog
   -> demo or CSV spectrum
   -> local wavelength window
+  -> line-family soft context
   -> window summary
   -> absorber hypothesis check
   -> continuum / normalized spectrum
   -> transition-frame physical Voigt posterior summary
      (public component parameters/model/residual come from posterior median;
       least-squares/MAP is initializer-only and never a public fallback)
+  -> optional LSF diagnostic model/residual
+     (only when per-transition LSF/resolution matrix is supplied;
+      not used as the primary fit likelihood)
   -> Task A rule suggestion
   -> human review fields
   -> JSON/CSV review packet
@@ -108,6 +112,8 @@ line catalog
 
 - 不要先重构成大型 pipeline。
 - 不要把 doublet 的不同 transition 压进同一个共享速度轴里直接拟合。
+- 不要把 doublet/multiplet sibling 不一致当作硬失败；保留 outlier，并交给 agent/人工报告和解释。
+- 不要在没有真实 LSF/resolution matrix 时猜一个 LSF 去改主拟合参数。
 - 不要在本仓库里重复实现已经稳定的线表、速度换算和 Voigt/profile 基础工具。
 - 不要先训练模型。
 - 不要把 `Egent/` 当成本项目主代码改。
