@@ -103,6 +103,7 @@ outputs/review_packet/
 当前开发版的 LLM/agent 层由 `src/astroagent/agent/llm.py`、`src/astroagent/agent/fit_control.py` 和 `src/astroagent/agent/loop.py` 组成。它们负责：
 
 - 把 review packet 压缩成 `fit_control` prompt messages，并可附带 `*.plot.png`。
+- `fit_control` prompt 只传决策摘要，不传完整 per-pixel residual arrays、完整 posterior detail 或 provider raw payload；完整数据仍保存在 review JSON/CSV artifact。
 - 暴露第一层拟合控制工具：增删/更新 source，改 fit window，改吸收 mask，改 continuum anchors/masks，请求 refit。
 - 把第一层工具调用保存成 `fit_control_patch`。
 - 把 patch 变成确定性的 fitter overrides，执行 refit，并记录 deterministic gate 决策。

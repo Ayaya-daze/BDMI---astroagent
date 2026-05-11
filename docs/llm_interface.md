@@ -25,6 +25,8 @@
 
 每个 `transition_frame` 也会带 `ion`、`partner_line_id` 和 `family_context`，帮助模型理解 velocity-frame 图之间的关系。
 
+`fit_control` prompt 不是完整 `review.json` 的逐字段转储。完整 per-pixel residual、diagnostic residual、posterior initializer 细节和 provider raw payload 仍保存在 review JSON/CSV artifact 中；发给 LLM 的版本只保留决策摘要：当前 fit metrics、每条 transition 的窗口/质量/top residual 摘要、核心 component 参数、LSF 诊断摘要、loop history 和上一轮 gate feedback。上一轮 refit feedback 也只注入 summary，避免在第二轮重复塞入完整 fit summary。
+
 ## LSF 诊断边界
 
 当前主拟合仍是 intrinsic physical Voigt posterior：公开参数、主 `voigt_model`、主 residual 和 gate 指标来自没有 LSF 卷积的 posterior median 模型。这样避免在没有真实 LSF 时用猜测的 Gaussian/常数分辨率污染参数。

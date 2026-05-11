@@ -668,6 +668,40 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertIn("not an automatic failure", text)
         self.assertIn("Preserve and report single-member", text)
 
+    def test_fit_control_prompt_compacts_transition_frames_and_refit_feedback(self):
+        record = self._demo_record()
+        fit_summary = record["fit_results"][0]
+        record["fit_control_last_refit_feedback"] = {
+            "sample_id": "compact_feedback_demo_loop1",
+            "evaluation": {"decision": "accepted", "metrics": {"delta": {"fit_rms": -0.1}}},
+            "patch": {"requires_refit": True, "tool_calls": []},
+            "fit_summary": fit_summary,
+            "assessment_control": {
+                "task": "fit_control",
+                "status": "no_action",
+                "rationale": "improved enough",
+                "raw": {"large_provider_payload": True},
+            },
+        }
+
+        messages = build_fit_control_messages(record)
+        text = messages[1].content
+        payload = json.loads(text[text.index("{") :])
+        frame = payload["fit_summary"]["transition_frames"][0]
+        feedback = payload["fit_control_context"]["last_refit_feedback"]
+        feedback_fit = feedback["fit_summary"]
+
+        self.assertIn("residual_sample_summary", frame)
+        self.assertIn("top_abs_residual_samples", frame["residual_sample_summary"])
+        self.assertNotIn("residual_samples", frame)
+        self.assertNotIn("diagnostic_residual_samples", frame)
+        self.assertNotIn("diagnostic_details", json.dumps(frame))
+        self.assertIn("transition_frame_summaries", feedback_fit)
+        self.assertIn("component_summaries", feedback_fit)
+        self.assertNotIn("transition_frames", feedback_fit)
+        self.assertNotIn("components", feedback_fit)
+        self.assertNotIn("raw", feedback["assessment_control"])
+
     def test_continuum_changed_carryover_sources_are_soft_position_priors(self):
         original_fit = {
             "components": [

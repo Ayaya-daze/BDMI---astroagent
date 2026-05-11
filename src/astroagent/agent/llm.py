@@ -374,8 +374,8 @@ def build_fit_control_messages(
         "fit_summary": _compact_fit_summary(fit_summary),
         "fit_control_context": {
             "loop": record.get("fit_control_loop"),
-            "last_refit_feedback": record.get("fit_control_last_refit_feedback"),
-            "last_rejected_refit": record.get("fit_control_last_rejected_refit"),
+            "last_refit_feedback": _compact_refit_feedback(record.get("fit_control_last_refit_feedback")),
+            "last_rejected_refit": _compact_refit_feedback(record.get("fit_control_last_rejected_refit")),
             "source_work_window_kms": record.get("fit_control_hints", {}).get("source_work_window_kms", [-400.0, 400.0]),
             "source_core_window_kms": record.get("fit_control_hints", {}).get("source_core_window_kms", [-360.0, 360.0]),
             "priority_order": record.get("fit_control_hints", {}).get(
@@ -719,7 +719,7 @@ def validate_fit_review(review: dict[str, Any]) -> None:
 
 def _compact_fit_summary(fit_summary: dict[str, Any]) -> dict[str, Any]:
     transition_frames = _compact_transition_frames(fit_summary.get("transition_frames"))
-    components = _strip_fit_initializer_fields(fit_summary.get("components"))
+    components = _compact_components(fit_summary.get("components"))
     return {
         "fit_type": fit_summary.get("fit_type"),
         "fit_method": fit_summary.get("fit_method"),
@@ -743,6 +743,90 @@ def _compact_fit_summary(fit_summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _compact_refit_feedback(value: Any) -> Any:
+    if not isinstance(value, dict):
+        return value
+    compact = _strip_fit_initializer_fields(value)
+    if not isinstance(compact, dict):
+        return compact
+    if isinstance(compact.get("fit_summary"), dict):
+        compact["fit_summary"] = _compact_feedback_fit_summary(compact["fit_summary"])
+    if isinstance(compact.get("assessment_control"), dict):
+        compact["assessment_control"] = _keep_keys(
+            compact["assessment_control"],
+            {"task", "status", "rationale", "tool_calls"},
+        )
+    return compact
+
+
+def _compact_feedback_fit_summary(fit_summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "success": fit_summary.get("success"),
+        "quality": fit_summary.get("quality"),
+        "fit_rms": fit_summary.get("fit_rms"),
+        "reduced_chi2": fit_summary.get("reduced_chi2"),
+        "source_work_window_metrics": fit_summary.get("source_work_window_metrics"),
+        "lsf": fit_summary.get("lsf"),
+        "instrument_lsf_applied_to_fit_likelihood": fit_summary.get("instrument_lsf_applied_to_fit_likelihood"),
+        "n_transition_frames": fit_summary.get("n_transition_frames"),
+        "n_components_fitted": fit_summary.get("n_components_fitted"),
+        "agent_review": fit_summary.get("agent_review"),
+        "transition_frame_summaries": _compact_feedback_transition_frames(fit_summary.get("transition_frames")),
+        "component_summaries": _compact_feedback_components(fit_summary.get("components")),
+    }
+
+
+def _compact_feedback_transition_frames(value: Any) -> Any:
+    frames = _strip_fit_initializer_fields(value)
+    if not isinstance(frames, list):
+        return frames
+    summaries: list[dict[str, Any]] = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        diagnostic = frame.get("lsf_diagnostic")
+        summary = {
+            "transition_line_id": frame.get("transition_line_id"),
+            "quality": frame.get("quality"),
+            "success": frame.get("success"),
+            "fit_metrics": frame.get("fit_metrics"),
+            "source_work_window_metrics": frame.get("source_work_window_metrics"),
+            "agent_review_required": frame.get("agent_review_required"),
+            "agent_review_reasons": frame.get("agent_review_reasons"),
+            "n_successful_peak_fits": frame.get("n_successful_peak_fits"),
+            "residual_sample_summary": _compact_residual_samples(frame.get("residual_samples", []), max_samples=5),
+        }
+        if isinstance(diagnostic, dict) and diagnostic.get("available"):
+            summary["lsf_diagnostic"] = _compact_lsf_diagnostic(diagnostic)
+        elif isinstance(diagnostic, dict):
+            summary["lsf_diagnostic"] = _keep_keys(diagnostic, {"available", "comparison"})
+        summaries.append(summary)
+    return summaries
+
+
+def _compact_feedback_components(value: Any, *, max_items: int = 8) -> Any:
+    components = _strip_fit_initializer_fields(value)
+    if not isinstance(components, list):
+        return components
+    fields = (
+        "component_index",
+        "transition_line_id",
+        "fit_success",
+        "center_velocity_kms",
+        "logN",
+        "b_kms",
+        "fit_rms",
+        "reduced_chi2",
+        "diagnostic_flags",
+        "diagnostic_warnings",
+    )
+    return [
+        {key: component.get(key) for key in fields if key in component}
+        for component in components[: int(max_items)]
+        if isinstance(component, dict)
+    ]
+
+
 def _compact_transition_frames(value: Any) -> Any:
     frames = _strip_fit_initializer_fields(value)
     if not isinstance(frames, list):
@@ -753,10 +837,52 @@ def _compact_transition_frames(value: Any) -> Any:
 def _compact_transition_frame(frame: Any) -> Any:
     if not isinstance(frame, dict):
         return frame
-    compact = dict(frame)
-    diagnostic = compact.get("lsf_diagnostic")
+    compact = {
+        "transition_line_id": frame.get("transition_line_id"),
+        "family": frame.get("family"),
+        "ion": frame.get("ion"),
+        "partner_line_id": frame.get("partner_line_id"),
+        "family_context": frame.get("family_context"),
+        "rest_wavelength_A": frame.get("rest_wavelength_A"),
+        "observed_center_A": frame.get("observed_center_A"),
+        "oscillator_strength": frame.get("oscillator_strength"),
+        "velocity_frame": _keep_keys(frame.get("velocity_frame"), {"zero", "bounds_kms", "n_good_pixels"}),
+        "simultaneous_fit_window": _keep_keys(
+            frame.get("simultaneous_fit_window"),
+            {
+                "bounds_kms",
+                "source_fit_bounds_kms",
+                "source_fit_policy",
+                "sibling_mask_mode",
+                "masked_by",
+            },
+        ),
+        "sibling_transition_masks": _compact_list(frame.get("sibling_transition_masks"), max_items=6),
+        "quality": frame.get("quality"),
+        "success": frame.get("success"),
+        "quality_warnings": frame.get("quality_warnings"),
+        "agent_review_required": frame.get("agent_review_required"),
+        "agent_review_reasons": frame.get("agent_review_reasons"),
+        "peak_detection": _keep_keys(
+            frame.get("peak_detection"),
+            {"method", "source_detection_mode", "n_detected_peaks", "center_use"},
+        ),
+        "n_successful_peak_fits": frame.get("n_successful_peak_fits"),
+        "fit_metrics": frame.get("fit_metrics"),
+        "source_work_window_metrics": frame.get("source_work_window_metrics"),
+        "peaks": _compact_components(frame.get("peaks")),
+        "residual_sample_summary": _compact_residual_samples(frame.get("residual_samples", [])),
+        "diagnostic_residual_sample_summary": _compact_residual_samples(
+            frame.get("diagnostic_residual_samples", []),
+            max_samples=8,
+        ),
+        "lsf": frame.get("lsf"),
+    }
+    diagnostic = frame.get("lsf_diagnostic")
     if isinstance(diagnostic, dict) and diagnostic.get("available"):
         compact["lsf_diagnostic"] = _compact_lsf_diagnostic(diagnostic)
+    elif isinstance(diagnostic, dict):
+        compact["lsf_diagnostic"] = _keep_keys(diagnostic, {"available", "comparison"})
     return compact
 
 
@@ -775,6 +901,10 @@ def _compact_lsf_diagnostic(diagnostic: dict[str, Any]) -> dict[str, Any]:
 
 
 def _compact_lsf_residual_samples(samples: Any, *, max_samples: int = 10) -> dict[str, Any]:
+    return _compact_residual_samples(samples, max_samples=max_samples)
+
+
+def _compact_residual_samples(samples: Any, *, max_samples: int = 10) -> dict[str, Any]:
     if not isinstance(samples, list) or not samples:
         return {"n_samples": 0, "top_abs_residual_samples": []}
     rows = [
@@ -793,6 +923,66 @@ def _compact_lsf_residual_samples(samples: Any, *, max_samples: int = 10) -> dic
             for sample in rows[: int(max_samples)]
         ],
     }
+
+
+def _compact_components(value: Any, *, max_items: int = 12) -> Any:
+    components = _strip_fit_initializer_fields(value)
+    if not isinstance(components, list):
+        return components
+    return [_compact_component(component) for component in components[: int(max_items)]]
+
+
+def _compact_component(component: Any) -> Any:
+    if not isinstance(component, dict):
+        return component
+    fields = (
+        "kind",
+        "component_index",
+        "transition_line_id",
+        "seed_source",
+        "reason",
+        "fit_success",
+        "quality",
+        "center_velocity_kms",
+        "center_offset_from_seed_kms",
+        "seed_velocity_kms",
+        "center_wavelength_A",
+        "logN",
+        "b_kms",
+        "tau_scale",
+        "fit_rms",
+        "reduced_chi2",
+        "n_fit_pixels",
+        "trough_velocity_min_kms",
+        "trough_velocity_max_kms",
+        "diagnostic_flags",
+        "diagnostic_warnings",
+        "observed_equivalent_width_mA",
+    )
+    compact = {key: component.get(key) for key in fields if key in component}
+    intervals = component.get("parameter_intervals")
+    if isinstance(intervals, dict):
+        compact["parameter_intervals"] = {
+            key: intervals.get(key)
+            for key in ("center_velocity_kms", "logN", "b_kms")
+            if key in intervals
+        }
+    center_prior = component.get("center_prior")
+    if isinstance(center_prior, dict):
+        compact["center_prior"] = _keep_keys(center_prior, {"mean_kms", "sigma_kms", "bounds_kms"})
+    return compact
+
+
+def _keep_keys(value: Any, keys: set[str]) -> Any:
+    if not isinstance(value, dict):
+        return value
+    return {key: value.get(key) for key in keys if key in value}
+
+
+def _compact_list(value: Any, *, max_items: int = 8) -> Any:
+    if not isinstance(value, list):
+        return value
+    return value[: int(max_items)]
 
 
 def _strip_fit_initializer_fields(value: Any) -> Any:
