@@ -19,7 +19,7 @@ from astroagent.agent.loop import (
     FitControlAgentState,
     run_fit_control_loop,
 )
-from astroagent.agent.llm import LLMResult, OfflineReviewClient
+from astroagent.agent.llm import LLMResult, OfflineReviewClient, build_fit_control_messages
 from astroagent.review.packet import build_review_record, make_demo_quasar_spectrum
 
 
@@ -266,6 +266,8 @@ class FitControlLoopTest(unittest.TestCase):
         self.assertEqual(first_round["assessment_control_status"], "tool_calls")
         self.assertEqual(second_round["decision_control_status"], "tool_calls")
         self.assertEqual(second_round["assessment_control_status"], "tool_calls")
+        self.assertEqual(first_round["evaluation_controls_scope"], "round_delta")
+        self.assertEqual(second_round["evaluation_controls_scope"], "round_delta")
         self.assertTrue(first_round["budget_decision"]["approved"])
         self.assertEqual(first_round["budget_decision"]["new_round_limit"], 2)
         self.assertEqual(len(result.history), 2)
@@ -481,6 +483,89 @@ class FitControlLoopTest(unittest.TestCase):
         self.assertEqual(edit_profile["continuum_edit_count"], 0)
         self.assertEqual(edit_profile["fit_mask_window_edit_count"], 1)
         self.assertFalse(edit_profile["continuum_changed"])
+
+    def test_trial_branch_assessment_feedback_uses_cumulative_evaluation_controls(self):
+        record, window = self._demo_record_and_window()
+        transition_id = record["input"]["transitions"][0]["transition_line_id"]
+        active_controls = {
+            **empty_fit_control_overrides(),
+            "continuum_mask_intervals_A": [
+                {
+                    "start_wavelength_A": 5540.0,
+                    "end_wavelength_A": 5560.0,
+                    "mask_kind": "exclude",
+                    "reason": "previous rejected trial",
+                }
+            ],
+            "tool_calls": [
+                {
+                    "name": "update_continuum_mask",
+                    "arguments": {
+                        "start_wavelength_A": 5540.0,
+                        "end_wavelength_A": 5560.0,
+                        "mask_kind": "exclude",
+                        "reason": "previous rejected trial",
+                    },
+                }
+            ],
+        }
+        control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "current mask on top of rejected trial",
+            "tool_calls": [
+                {
+                    "name": "set_fit_mask_interval",
+                    "arguments": {
+                        "transition_line_id": transition_id,
+                        "start_velocity_kms": 500.0,
+                        "end_velocity_kms": 575.0,
+                        "mask_kind": "exclude",
+                        "reason": "current round edge mask",
+                    },
+                }
+            ],
+        }
+        patch, _, candidate_controls, effective_patch = _prepare_round_controls(
+            record,
+            control,
+            active_controls,
+            round_index=2,
+        )
+        effective_patch["evaluation_controls_scope"] = "trial_branch"
+        effective_patch["evaluation_controls"] = {
+            key: value
+            for key, value in candidate_controls.items()
+            if key != "tool_calls"
+        }
+
+        with tempfile.TemporaryDirectory(prefix="astroagent_loop_trial_branch_") as tmpdir:
+            candidate = _execute_candidate(
+                FitControlAgentState(record=record, image_paths=None, controls=active_controls),
+                window,
+                effective_patch,
+                candidate_controls,
+                candidate_controls,
+                Path(tmpdir),
+                sample_id="trial_branch_demo_loop2",
+            )
+
+        stored_patch = candidate.record["fit_control_patches"][0]
+        self.assertEqual(stored_patch["evaluation_controls_scope"], "trial_branch")
+        self.assertEqual(len(stored_patch["evaluation_controls"]["continuum_mask_intervals_A"]), 1)
+        self.assertEqual(len(stored_patch["evaluation_controls"]["fit_mask_intervals"]), 1)
+        self.assertEqual([call["name"] for call in patch["tool_calls"]], ["set_fit_mask_interval"])
+
+        feedback = {
+            "sample_id": candidate.record.get("sample_id"),
+            "evaluation": candidate.evaluation,
+            "patch": stored_patch,
+            "fit_summary": candidate.record.get("fit_results", [{}])[0],
+        }
+        record_with_feedback = {**record, "fit_control_last_refit_feedback": feedback}
+
+        messages = build_fit_control_messages(record_with_feedback)
+        self.assertIn('"evaluation_controls_scope": "trial_branch"', str(messages[1].content))
 
     def test_assessment_patch_only_carries_budget_request(self):
         patch = {

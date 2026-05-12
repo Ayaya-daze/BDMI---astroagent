@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -27,6 +28,7 @@ from astroagent.agent.fit_control import (
     refit_record_with_patch,
 )
 from astroagent.agent.llm import (
+    FitControlPromptTemplates,
     LLMMessage,
     LLMResult,
     OfflineReviewClient,
@@ -96,6 +98,126 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertIn("## Structured Context", text)
         self.assertNotIn("{{PROMPT_PAYLOAD_JSON}}", text)
         self.assertIn("\"sample_id\"", text)
+
+    def test_fit_control_prompt_can_use_external_templates_with_metadata(self):
+        class NoActionClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content=json.dumps(
+                        {
+                            "task": "fit_control",
+                            "status": "no_action",
+                            "tool_calls": [],
+                            "rationale": "external template rendered",
+                        }
+                    ),
+                    model="unit-template-model",
+                    raw={"unit": True},
+                )
+
+        with tempfile.TemporaryDirectory(prefix="astroagent_prompt_templates_") as tmpdir:
+            template_dir = Path(tmpdir)
+            (template_dir / "fit_control_system.md").write_text("Custom system prompt\n", encoding="utf-8")
+            (template_dir / "fit_control_user.md").write_text(
+                "Custom user prompt\n{{PROMPT_PAYLOAD_JSON}}\n",
+                encoding="utf-8",
+            )
+            prompt_templates = FitControlPromptTemplates(template_dir=template_dir, version="unit-v1")
+
+            messages = build_fit_control_messages(self._demo_record(), prompt_templates=prompt_templates)
+            control = run_fit_control(self._demo_record(), NoActionClient(), prompt_templates=prompt_templates)
+
+        self.assertEqual(messages[0].content, "Custom system prompt")
+        self.assertTrue(str(messages[1].content).startswith("Custom user prompt"))
+        self.assertEqual(control["_llm_metadata"]["prompt_templates"]["version"], "unit-v1")
+        self.assertEqual(control["_llm_metadata"]["prompt_templates"]["template_dir"], str(template_dir))
+        self.assertIn("system_sha256", control["_llm_metadata"]["prompt_templates"])
+        self.assertIn("user_sha256", control["_llm_metadata"]["prompt_templates"])
+
+    def test_fit_control_prompt_metadata_hashes_actual_messages(self):
+        class MutatingClient:
+            def __init__(self, template_dir):
+                self.template_dir = template_dir
+
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                (self.template_dir / "fit_control_user.md").write_text(
+                    "Mutated prompt\n{{PROMPT_PAYLOAD_JSON}}\n",
+                    encoding="utf-8",
+                )
+                return LLMResult(
+                    content=json.dumps(
+                        {
+                            "task": "fit_control",
+                            "status": "no_action",
+                            "tool_calls": [],
+                            "rationale": "metadata should hash original message",
+                        }
+                    ),
+                    model="unit-mutating-template-model",
+                    raw={"unit": True},
+                )
+
+        with tempfile.TemporaryDirectory(prefix="astroagent_prompt_metadata_") as tmpdir:
+            template_dir = Path(tmpdir)
+            (template_dir / "fit_control_system.md").write_text("Stable system\n", encoding="utf-8")
+            (template_dir / "fit_control_user.md").write_text(
+                "Original prompt\n{{PROMPT_PAYLOAD_JSON}}\n",
+                encoding="utf-8",
+            )
+            prompt_templates = FitControlPromptTemplates(template_dir=template_dir)
+            messages = build_fit_control_messages(self._demo_record(), prompt_templates=prompt_templates)
+            control = run_fit_control(
+                self._demo_record(),
+                MutatingClient(template_dir),
+                prompt_templates=prompt_templates,
+            )
+
+        expected_user_hash = hashlib.sha256(str(messages[1].content).encode("utf-8")).hexdigest()
+        self.assertEqual(control["_llm_metadata"]["prompt_templates"]["user_sha256"], expected_user_hash)
+
+    def test_fit_control_prompt_metadata_hashes_multimodal_user_content(self):
+        class NoActionClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content=json.dumps(
+                        {
+                            "task": "fit_control",
+                            "status": "no_action",
+                            "tool_calls": [],
+                            "rationale": "hash multimodal content",
+                        }
+                    ),
+                    model="unit-multimodal-hash-model",
+                    raw={"unit": True},
+                )
+
+        with tempfile.TemporaryDirectory(prefix="astroagent_multimodal_hash_") as tmpdir:
+            image_a = Path(tmpdir) / "fit.png"
+            image_b = Path(tmpdir) / "fit.png"
+            image_a.write_bytes(b"\x89PNG\r\n\x1a\nimage-a")
+            control_a = run_fit_control(self._demo_record(), NoActionClient(), plot_image_path=image_a)
+            image_b.write_bytes(b"\x89PNG\r\n\x1a\nimage-b")
+            control_b = run_fit_control(self._demo_record(), NoActionClient(), plot_image_path=image_b)
+
+        self.assertNotEqual(
+            control_a["_llm_metadata"]["prompt_templates"]["user_sha256"],
+            control_b["_llm_metadata"]["prompt_templates"]["user_sha256"],
+        )
+
+    def test_fit_control_prompt_rejects_duplicate_payload_placeholder(self):
+        with tempfile.TemporaryDirectory(prefix="astroagent_bad_prompt_templates_") as tmpdir:
+            template_dir = Path(tmpdir)
+            (template_dir / "fit_control_system.md").write_text("Custom system prompt\n", encoding="utf-8")
+            (template_dir / "fit_control_user.md").write_text(
+                "{{PROMPT_PAYLOAD_JSON}}\n{{PROMPT_PAYLOAD_JSON}}\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                build_fit_control_messages(
+                    self._demo_record(),
+                    prompt_templates=FitControlPromptTemplates(template_dir=template_dir),
+                )
 
     def test_fit_control_messages_can_include_plot_image(self):
         record = self._demo_record()
@@ -185,6 +307,161 @@ class LLMInterfaceTest(unittest.TestCase):
         self.assertEqual(control["_llm_metadata"]["model"], "unit-tool-model")
         self.assertEqual([call["name"] for call in control["tool_calls"]], ["add_continuum_anchor", "request_refit"])
         self.assertEqual(control["tool_calls"][0]["arguments"]["wavelength_A"], 5575.0)
+
+    def test_run_fit_control_limits_provider_tools_and_filters_disallowed_tool_calls(self):
+        class CapturingClient:
+            def __init__(self):
+                self.tool_names = []
+
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                self.tool_names = [tool["function"]["name"] for tool in tools]
+                return LLMResult(
+                    content="",
+                    model="unit-filter-provider-tools",
+                    raw={"unit": True},
+                    tool_calls=[
+                        {
+                            "id": "call_budget",
+                            "type": "function",
+                            "function": {
+                                "name": "request_more_budget",
+                                "arguments": json.dumps(
+                                    {
+                                        "requested_rounds": 1,
+                                        "next_experiment": "try a narrow source edit",
+                                        "reason": "assessment found a follow-up",
+                                    }
+                                ),
+                            },
+                        },
+                        {
+                            "id": "call_edit",
+                            "type": "function",
+                            "function": {
+                                "name": "add_absorption_source",
+                                "arguments": json.dumps(
+                                    {
+                                        "transition_line_id": "CIV_1548",
+                                        "center_velocity_kms": 20.0,
+                                        "reason": "not allowed during assessment",
+                                    }
+                                ),
+                            },
+                        },
+                    ],
+                )
+
+        client = CapturingClient()
+        control = run_fit_control(self._demo_record(), client, allowed_tool_names={"request_more_budget"})
+
+        self.assertEqual(client.tool_names, ["request_more_budget"])
+        self.assertEqual([call["name"] for call in control["tool_calls"]], ["request_more_budget"])
+        self.assertEqual(control["_llm_metadata"]["filtered_tool_calls"], [{"id": "call_edit", "name": "add_absorption_source"}])
+
+    def test_run_fit_control_rejects_unknown_allowed_tool_name(self):
+        with self.assertRaisesRegex(ValueError, "unknown allowed fit-control tools"):
+            run_fit_control(self._demo_record(), ToolCallingClient(), allowed_tool_names={"request_more_buget"})
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            run_fit_control(self._demo_record(), ToolCallingClient(), allowed_tool_names=set())
+
+    def test_run_fit_control_filters_disallowed_json_tool_calls_before_validation(self):
+        class JsonToolCallClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content=json.dumps(
+                        {
+                            "task": "fit_control",
+                            "status": "tool_calls",
+                            "rationale": "mixed assessment response",
+                            "tool_calls": [
+                                {
+                                    "name": "request_more_budget",
+                                    "arguments": {
+                                        "requested_rounds": 1,
+                                        "next_experiment": "try a narrow source edit",
+                                        "reason": "assessment found a follow-up",
+                                    },
+                                },
+                                {
+                                    "name": "add_absorption_source",
+                                    "arguments": {
+                                        "transition_line_id": "CIV_1548",
+                                        "center_velocity_kms": "20",
+                                        "reason": "would fail strict validation if not filtered",
+                                    },
+                                },
+                            ],
+                        }
+                    ),
+                    model="unit-filter-json-tools",
+                    raw={"unit": True},
+                )
+
+        control = run_fit_control(self._demo_record(), JsonToolCallClient(), allowed_tool_names={"request_more_budget"})
+
+        self.assertEqual([call["name"] for call in control["tool_calls"]], ["request_more_budget"])
+        self.assertEqual(control["_llm_metadata"]["filtered_tool_calls"], [{"id": None, "name": "add_absorption_source"}])
+
+    def test_run_fit_control_explains_when_only_disallowed_provider_tools_were_returned(self):
+        class DisallowedOnlyClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content="",
+                    model="unit-disallowed-only",
+                    raw={"unit": True},
+                    tool_calls=[
+                        {
+                            "id": "call_edit",
+                            "type": "function",
+                            "function": {
+                                "name": "add_absorption_source",
+                                "arguments": json.dumps(
+                                    {
+                                        "transition_line_id": "CIV_1548",
+                                        "center_velocity_kms": 20.0,
+                                        "reason": "not allowed during assessment",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                )
+
+        control = run_fit_control(self._demo_record(), DisallowedOnlyClient(), allowed_tool_names={"request_more_budget"})
+
+        self.assertEqual(control["status"], "inspect")
+        self.assertIn("outside this step's allowed tool set", control["rationale"])
+        self.assertEqual(control["_llm_metadata"]["filtered_tool_calls"], [{"id": "call_edit", "name": "add_absorption_source"}])
+
+    def test_run_fit_control_explains_when_only_disallowed_json_tools_were_returned(self):
+        class DisallowedJsonClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content=json.dumps(
+                        {
+                            "task": "fit_control",
+                            "status": "tool_calls",
+                            "rationale": "raw model rationale",
+                            "tool_calls": [
+                                {
+                                    "name": "add_absorption_source",
+                                    "arguments": {
+                                        "transition_line_id": "CIV_1548",
+                                        "center_velocity_kms": 20.0,
+                                        "reason": "not allowed during assessment",
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                    model="unit-disallowed-json",
+                    raw={"unit": True},
+                )
+
+        control = run_fit_control(self._demo_record(), DisallowedJsonClient(), allowed_tool_names={"request_more_budget"})
+
+        self.assertEqual(control["status"], "inspect")
+        self.assertIn("outside this step's allowed tool set", control["rationale"])
 
     def test_run_fit_control_defaults_missing_rationale_for_json_response(self):
         class MissingRationaleClient:
@@ -312,6 +589,73 @@ class LLMInterfaceTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "missing required arguments"):
+            build_fit_control_patch(control, source="unit")
+
+    def test_build_fit_control_patch_rejects_numeric_strings_and_bool_in_tool_arguments(self):
+        numeric_string_control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "bad numeric type",
+            "tool_calls": [
+                {
+                    "name": "add_absorption_source",
+                    "arguments": {
+                        "transition_line_id": "CIV_1548",
+                        "center_velocity_kms": "10.0",
+                        "reason": "numeric string",
+                    },
+                }
+            ],
+        }
+        bool_integer_control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "bad integer type",
+            "tool_calls": [
+                {
+                    "name": "request_more_budget",
+                    "arguments": {
+                        "requested_rounds": True,
+                        "next_experiment": "continue",
+                        "reason": "bool is not an integer",
+                    },
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            build_fit_control_patch(numeric_string_control, source="unit")
+        with self.assertRaisesRegex(ValueError, "integer"):
+            build_fit_control_patch(bool_integer_control, source="unit")
+
+    def test_request_more_budget_rejects_values_above_tool_schema_maximum(self):
+        class JsonBudgetClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content=json.dumps(control),
+                    model="unit-budget-max",
+                    raw={"unit": True},
+                )
+
+        control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "too much budget",
+            "tool_calls": [
+                {
+                    "name": "request_more_budget",
+                    "arguments": {
+                        "requested_rounds": 999,
+                        "next_experiment": "continue",
+                        "reason": "exceeds schema maximum",
+                    },
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "<= 5"):
+            run_fit_control(self._demo_record(), JsonBudgetClient())
+        with self.assertRaisesRegex(ValueError, "<= 5"):
             build_fit_control_patch(control, source="unit")
 
     def test_run_fit_control_rejects_invalid_provider_tool_json(self):

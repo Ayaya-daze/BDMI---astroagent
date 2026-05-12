@@ -793,17 +793,15 @@ def _validate_patch_call_arguments(name: str, arguments: dict[str, Any]) -> None
         "end_wavelength_A",
     }
     for key in numeric_keys & set(arguments):
-        if not _finite(arguments.get(key)):
+        if not _strict_finite_number(arguments.get(key)):
             raise ValueError(f"fit-control tool {name} argument {key} must be a finite number")
     for key in {"component_index", "anchor_index", "requested_rounds"} & set(arguments):
-        try:
-            parsed = int(arguments.get(key))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"fit-control tool {name} argument {key} must be an integer") from exc
-        if isinstance(arguments.get(key), float) and not float(arguments[key]).is_integer():
+        if not _strict_integer(arguments.get(key)):
             raise ValueError(f"fit-control tool {name} argument {key} must be an integer")
-        if key == "requested_rounds" and parsed < 1:
+        if key == "requested_rounds" and int(arguments[key]) < 1:
             raise ValueError("fit-control tool request_more_budget argument requested_rounds must be >= 1")
+        if key == "requested_rounds" and int(arguments[key]) > 5:
+            raise ValueError("fit-control tool request_more_budget argument requested_rounds must be <= 5")
     if arguments.get("mask_kind") is not None and arguments.get("mask_kind") not in {"include", "exclude"}:
         raise ValueError(f"fit-control tool {name} argument mask_kind must be include or exclude")
     if arguments.get("sibling_mask_mode") is not None and arguments.get("sibling_mask_mode") not in {"exclude", "allow_overlap"}:
@@ -825,6 +823,14 @@ def _requires_refit(tool_calls: list[dict[str, Any]]) -> bool:
         "update_continuum_mask",
     }
     return any(call.get("name") in refit_tools for call in tool_calls)
+
+
+def _strict_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and _finite(value)
+
+
+def _strict_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _dedupe_source_seeds(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:

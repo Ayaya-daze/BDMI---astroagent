@@ -57,18 +57,19 @@
 ## 当前开发切片
 
 - `src/astroagent/agent/llm.py`
-  - `build_fit_control_messages(record, plot_image_path=None)`：把 review packet 压缩成 fit-control messages，可附带图像。
-  - `fit_control` 的长 prompt 不写在 Python 里，而是从 `src/astroagent/agent/prompts/fit_control_system.md` 和 `src/astroagent/agent/prompts/fit_control_user.md` 读取；user 模板用 `{{PROMPT_PAYLOAD_JSON}}` 标记结构化上下文插入位置，方便 harness 后续替换或版本化 prompt。
-  - `run_fit_control(record, client, plot_image_path=None)`：调用 client，解析 tool calls / JSON，并做最小 schema 检查。
+  - `build_fit_control_messages(record, plot_image_path=None, prompt_templates=None)`：把 review packet 压缩成 fit-control messages，可附带图像。
+  - `fit_control` 的长 prompt 不写在 Python 里，而是从 `src/astroagent/agent/prompts/fit_control_system.md` 和 `src/astroagent/agent/prompts/fit_control_user.md` 读取；user 模板必须恰好包含一个 `{{PROMPT_PAYLOAD_JSON}}` 标记。Harness 可以通过 `FitControlPromptTemplates(template_dir=..., version=...)` 或 CLI 的 `--prompt-template-dir` 替换 prompt，并用 `--prompt-version` 在 metadata 中标记 prompt 版本。
+  - `run_fit_control(record, client, plot_image_path=None, prompt_templates=None, allowed_tool_names=None)`：调用 client，解析 tool calls / JSON，并做最小 schema 检查；`allowed_tool_names` 用于 assessment 的 budget-only 工具边界。
   - `build_fit_review_messages(record, plot_image_path=None)`：把 review packet 压缩成复核 messages。
   - `run_fit_review(record, client, plot_image_path=None)`：调用 client，解析 JSON，并做最小 schema 检查。
-  - `OfflineReviewClient`：不联网，固定输出 `inspect`，用于测试链路。
+  - `OfflineReviewClient`：不联网；`fit_control` 固定输出 `no_action`，`fit_review` 固定输出 `inspect`，用于测试链路。
   - `OpenAICompatibleClient`：调用 OpenAI-compatible `/chat/completions` provider。
 - `src/astroagent/cli/run_fit_review.py`
   - 读取 `*.review.json`。
   - 可附带 `*.plot.png`。
   - 输出 `*.llm_review.json` 或 `*.llm_control.json`。
   - `fit_control` 模式额外输出 `*.fit_control_patch.json`，用于后续 refit loop 和 RL reward。
+  - `fit_control` 模式支持 `--prompt-template-dir/--prompt-version`，和 loop CLI 使用同一套 prompt 模板接口。
 - `src/astroagent/agent/fit_control.py`
   - 把 `fit_control_patch` 转成 deterministic fitter overrides。
   - 支持连续谱 anchors/masks、transition fit windows、fit masks、source seed 增删/更新。
@@ -93,7 +94,7 @@
 - `src/astroagent/cli/run_fit_control_loop.py`
   - 读取初始 `*.review.json`、`*.window.csv` 和可选 `*.plot.png`。
   - 输出每轮 refit 的 review packet，并写出 `*.fit_control_loop.json` summary。
-  - 对外保持和单轮 CLI 一样的 `--client offline|openai-compatible`、`--temperature` 风格。
+  - 对外保持和单轮 CLI 一样的 `--client offline|openai-compatible`、`--temperature`、`--prompt-template-dir/--prompt-version` 风格。
 - `scripts/run_fit_review.py`
   - 本地开发包装入口，不要求先安装包。
 - `scripts/run_fit_control_loop.py`
@@ -179,7 +180,7 @@ outputs/review_packet/demo_CIV_doublet_z2p6000.fit_control_patch.json
 这些统一入口会从 `sample_id` 自动推断同目录的 `*.window.csv`、`*.overview.png` 和 `*.plot.png`；旧的 `scripts/*.py` 包装入口仍然保留给未安装包的本地开发。
 `--max-rounds` 是初始完整实验轮预算；每轮包含一次 agent 决策、一次确定性 refit/gate、一次 agent assessment。assessment 会看到本轮刚生成的 refit feedback，并可通过 `request_more_budget` 申请进入下一轮；`--hard-max-rounds` 是绝对上限。loop 结束后会额外生成 `<sample_id>.audit/audit_report.md` 和 `audit_report.json`。报告只汇总已有 loop 历史、fit metrics 和 gate 信号，不替代人工科学裁决。
 
-工具调用会在 LLM 边界和 patch 边界做 required/type/enum 校验；缺字段、非 JSON arguments 或非有限数值会直接失败，不会记录为 `validated` 的 no-op。refit 可以继承累计 controls，但 deterministic gate 的 edit profile 只按当前轮 patch 计数，避免上一轮工具动作污染本轮评估。assessment 阶段只消费 `request_more_budget`；如果模型同时输出 source/mask/window/continuum 编辑，这些编辑不会执行，必须在获批后的下一轮 decision call 中重新提出。
+工具调用会在 LLM 边界和 patch 边界做 required/type/enum 校验；缺字段、非 JSON arguments、字符串数字、布尔数字或非有限数值会直接失败，不会记录为 `validated` 的 no-op。refit 可以继承累计 controls；正常主线轮次的 deterministic gate/edit profile 只按当前轮 patch 计数，避免上一轮工具动作污染本轮评估。若上一轮 refit 被拒绝，下一轮会在显式 `trial_branch` 中试验累计候选 controls，并在 loop history 里记录 `evaluation_controls_scope`。assessment 阶段传给 provider 的 tool schema 只包含 `request_more_budget`；如果 provider 仍返回越界工具名，这些工具会被过滤并记录在 `_llm_metadata.filtered_tool_calls`，必须在获批后的下一轮 decision call 中重新提出。
 
 `fit_control_loop` 的停止原因包括：
 

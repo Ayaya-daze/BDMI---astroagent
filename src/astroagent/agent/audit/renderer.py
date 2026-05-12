@@ -105,6 +105,7 @@ def _round_summary(entry: dict[str, Any]) -> dict[str, Any]:
         else None,
         "assessment_summary": entry.get("assessment_summary"),
         "decision": entry.get("decision"),
+        "evaluation_controls_scope": entry.get("evaluation_controls_scope"),
         "advanced": bool(entry.get("advanced")),
         "selected_candidate": bool(entry.get("selected_candidate")),
         "budget_request": entry.get("budget_request"),
@@ -254,14 +255,15 @@ def _render_markdown(payload: dict[str, Any]) -> str:
     lines.extend(["", "## Rounds", ""])
     rounds = payload.get("rounds", [])
     if rounds:
-        lines.extend(["| Round | Decision | Assessment | Tools | Gate | Notes |", "|---:|---|---|---|---|---|"])
+        lines.extend(["| Round | Decision | Assessment | Scope | Tools | Gate | Notes |", "|---:|---|---|---|---|---|---|"])
         for item in rounds:
             notes = "; ".join([*item.get("gate_reasons", []), *item.get("gate_warnings", [])]) or item.get("rationale") or ""
             lines.append(
-                "| {round_index} | `{decision_status}` | `{assessment_status}` | {tools} | `{gate_decision}` | {notes} |".format(
+                "| {round_index} | `{decision_status}` | `{assessment_status}` | `{scope}` | {tools} | `{gate_decision}` | {notes} |".format(
                     round_index=_display(item.get("round_index")),
                     decision_status=item.get("decision_control_status") or item.get("control_status") or "",
                     assessment_status=item.get("assessment_control_status") or "-",
+                    scope=item.get("evaluation_controls_scope") or "-",
                     tools=", ".join(item.get("tool_names", [])) or "-",
                     gate_decision=item.get("decision") or "",
                     notes=_escape_table(str(notes))[:500],
@@ -269,7 +271,7 @@ def _render_markdown(payload: dict[str, Any]) -> str:
             )
             if item.get("assessment_summary"):
                 lines.append(
-                    "|  |  |  |  | assessment | {summary} |".format(
+                    "|  |  |  |  |  | assessment | {summary} |".format(
                         summary=_escape_table(str(item.get("assessment_summary")))[:500]
                     )
                 )

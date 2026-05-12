@@ -15,7 +15,7 @@ from astroagent.agent.fit_control import (
     merge_fit_control_overrides,
     refit_record_with_overrides,
 )
-from astroagent.agent.llm import LLMClient, run_fit_control
+from astroagent.agent.llm import FitControlPromptTemplates, LLMClient, run_fit_control
 from astroagent.review.packet import write_review_packet
 
 
@@ -63,6 +63,7 @@ def run_fit_control_loop(
     max_rounds: int = 3,
     hard_max_rounds: int | None = None,
     temperature: float = 0.0,
+    prompt_templates: FitControlPromptTemplates | None = None,
     sample_id_prefix: str | None = None,
     force: bool = False,
 ) -> FitControlLoopResult:
@@ -96,6 +97,7 @@ def run_fit_control_loop(
     best_output_paths: dict[str, Path] | None = None
     best_score: tuple[float, float, int] | None = None
     trial_controls = state.controls
+    trial_controls_include_rejected_candidate = False
 
     if not force and not _fit_control_needed(state.record):
         stop_reason = "not_needed_good_fit"
@@ -133,6 +135,7 @@ def run_fit_control_loop(
             client,
             temperature=temperature,
             plot_image_path=image_paths,
+            prompt_templates=prompt_templates,
         )
         patch, round_overrides, candidate_controls, effective_patch = _prepare_round_controls(
             state.record,
@@ -157,6 +160,7 @@ def run_fit_control_loop(
             "budget_decision": None,
             "assessment_control": None,
             "assessment_summary": None,
+            "evaluation_controls_scope": None,
         }
 
         if not patch.get("requires_refit"):
@@ -173,12 +177,17 @@ def run_fit_control_loop(
             break
 
         refit_sample_id = f"{base_id}_loop{round_index}"
+        evaluation_controls_scope = "trial_branch" if trial_controls_include_rejected_candidate else "round_delta"
+        evaluation_controls = candidate_controls if trial_controls_include_rejected_candidate else round_overrides
+        effective_patch["evaluation_controls_scope"] = evaluation_controls_scope
+        effective_patch["evaluation_controls"] = _public_fit_control_controls(evaluation_controls)
+        round_entry["evaluation_controls_scope"] = evaluation_controls_scope
         candidate = _execute_candidate(
             state,
             window,
             effective_patch,
             candidate_controls,
-            round_overrides,
+            evaluation_controls,
             output_path,
             sample_id=refit_sample_id,
         )
@@ -200,12 +209,13 @@ def run_fit_control_loop(
             candidate=candidate,
             client=client,
             temperature=temperature,
-            patch=patch,
+            patch=effective_patch,
             evaluation=evaluation,
             history=[*history, round_entry],
             round_index=round_index,
             approved_round_limit=approved_round_limit,
             hard_max_rounds=effective_hard_max_rounds,
+            prompt_templates=prompt_templates,
         )
         round_entry["assessment_control"] = assessment_control
         round_entry["assessment_summary"] = assessment_control.get("rationale")
@@ -236,18 +246,19 @@ def run_fit_control_loop(
             state.record["fit_control_last_rejected_refit"] = {
                 "sample_id": candidate.record.get("sample_id"),
                 "evaluation": evaluation,
-                "patch": patch,
+                "patch": effective_patch,
                 "overview_png": str(candidate.output_paths.get("overview_png", "")),
                 "plot_png": str(candidate.output_paths.get("plot_png", "")),
             }
             state.record["fit_control_last_refit_feedback"] = {
                 "sample_id": candidate.record.get("sample_id"),
                 "evaluation": evaluation,
-                "patch": patch,
+                "patch": effective_patch,
                 "fit_summary": candidate.record.get("fit_results", [{}])[0],
                 "assessment_control": assessment_control,
             }
             trial_controls = candidate.controls
+            trial_controls_include_rejected_candidate = True
             if is_last_round:
                 stop_reason = "refit_rejected"
                 break
@@ -264,6 +275,7 @@ def run_fit_control_loop(
                 best_output_paths = candidate.output_paths
             state = _commit_candidate(candidate)
             trial_controls = state.controls
+            trial_controls_include_rejected_candidate = False
             if is_last_round:
                 stop_reason = "needs_human_review"
                 break
@@ -271,7 +283,7 @@ def run_fit_control_loop(
             state.record["fit_control_last_refit_feedback"] = {
                 "sample_id": candidate.record.get("sample_id"),
                 "evaluation": evaluation,
-                "patch": patch,
+                "patch": effective_patch,
                 "fit_summary": candidate.record.get("fit_results", [{}])[0],
                 "budget_decision": budget_decision,
                 "assessment_control": assessment_control,
@@ -291,12 +303,13 @@ def run_fit_control_loop(
         state.record["fit_control_last_refit_feedback"] = {
             "sample_id": candidate.record.get("sample_id"),
             "evaluation": evaluation,
-            "patch": patch,
+            "patch": effective_patch,
             "fit_summary": candidate.record.get("fit_results", [{}])[0],
             "budget_decision": budget_decision,
             "assessment_control": assessment_control,
         }
         trial_controls = state.controls
+        trial_controls_include_rejected_candidate = False
         round_index += 1
 
     else:
@@ -372,6 +385,7 @@ def _run_round_assessment(
     round_index: int,
     approved_round_limit: int,
     hard_max_rounds: int,
+    prompt_templates: FitControlPromptTemplates | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Let the agent inspect this same round's refit result and decide whether to continue."""
     feedback_record = deepcopy(candidate.record)
@@ -397,6 +411,8 @@ def _run_round_assessment(
         client,
         temperature=temperature,
         plot_image_path=candidate.image_paths,
+        prompt_templates=prompt_templates,
+        allowed_tool_names={"request_more_budget"},
     )
     assessment_patch = build_fit_control_patch(control, source=f"round_assessment_{round_index}")
     return control, assessment_patch
@@ -428,6 +444,7 @@ def _loop_record(history: list[dict[str, Any]], stop_reason: str | None) -> dict
                 "decision": entry.get("decision"),
                 "advanced": bool(entry.get("advanced")),
                 "rationale": entry.get("new_patch", {}).get("rationale") or entry.get("patch", {}).get("rationale"),
+                "evaluation_controls_scope": entry.get("evaluation_controls_scope"),
                 "overrides_summary": entry.get("overrides_summary", {}),
                 "candidate_score": list(entry["candidate_score"]) if entry.get("candidate_score") is not None else None,
                 "selected_candidate": bool(entry.get("selected_candidate")),
@@ -666,8 +683,22 @@ def _drop_regressive_broad_updates(patch: dict[str, Any], active_overrides: dict
         if not regressive:
             kept.append(call)
     updated["tool_calls"] = kept
-    updated["requires_refit"] = any(call.get("name") != "request_refit" for call in kept)
+    updated["requires_refit"] = _patch_has_concrete_refit_tool(kept)
     return updated
+
+
+def _patch_has_concrete_refit_tool(tool_calls: list[dict[str, Any]]) -> bool:
+    refit_tools = {
+        "add_absorption_source",
+        "remove_absorption_source",
+        "update_absorption_source",
+        "set_fit_mask_interval",
+        "set_fit_window",
+        "add_continuum_anchor",
+        "remove_continuum_anchor",
+        "update_continuum_mask",
+    }
+    return any(call.get("name") in refit_tools for call in tool_calls)
 
 
 def _coerce_distinct_repeated_updates_to_adds(patch: dict[str, Any]) -> dict[str, Any]:

@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from astroagent.agent.loop import run_fit_control_loop
-from astroagent.agent.llm import OfflineReviewClient, OpenAICompatibleClient
+from astroagent.agent.llm import FitControlPromptTemplates, OfflineReviewClient, OpenAICompatibleClient
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -20,6 +20,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-rounds", type=int, default=2, help="Initial experiment budget. The agent may request more rounds.")
     parser.add_argument("--hard-max-rounds", type=int, default=6, help="Absolute cap for agent-requested experiment rounds.")
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--prompt-template-dir", type=Path, default=None, help="Directory containing fit_control_system.md and fit_control_user.md.")
+    parser.add_argument("--prompt-version", default=None, help="Optional label recorded in LLM metadata for prompt A/B runs.")
     parser.add_argument("--force", action="store_true", help="Run fit-control even when the initial fit is already good.")
     parser.add_argument(
         "--client",
@@ -41,6 +43,11 @@ def main(argv: list[str] | None = None) -> None:
     image_paths = _initial_image_paths(args.review_json, record, overview_image=args.overview_image, plot_image=args.plot_image)
 
     client = OfflineReviewClient() if args.client == "offline" else OpenAICompatibleClient()
+    prompt_templates = (
+        FitControlPromptTemplates(template_dir=args.prompt_template_dir, version=args.prompt_version)
+        if args.prompt_template_dir is not None or args.prompt_version is not None
+        else None
+    )
     result = run_fit_control_loop(
         record=record,
         window=window,
@@ -50,6 +57,7 @@ def main(argv: list[str] | None = None) -> None:
         max_rounds=args.max_rounds,
         hard_max_rounds=args.hard_max_rounds,
         temperature=args.temperature,
+        prompt_templates=prompt_templates,
         force=args.force,
     )
 

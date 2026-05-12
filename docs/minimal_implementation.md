@@ -104,12 +104,12 @@ outputs/review_packet/
 
 - 把 review packet 压缩成 `fit_control` prompt messages，并可附带 `*.plot.png`。
 - `fit_control` prompt 只传决策摘要，不传完整 per-pixel residual arrays、完整 posterior detail 或 provider raw payload；完整数据仍保存在 review JSON/CSV artifact。
-- `fit_control` prompt 正文在 `src/astroagent/agent/prompts/*.md`，Python 只加载模板并注入 `{{PROMPT_PAYLOAD_JSON}}`。
+- `fit_control` prompt 正文在 `src/astroagent/agent/prompts/*.md`，Python 只加载模板并注入唯一的 `{{PROMPT_PAYLOAD_JSON}}`；harness 可通过 `FitControlPromptTemplates` 或 CLI 的 `--prompt-template-dir` 替换模板，并用 `--prompt-version` 在 metadata 中标记版本。
 - 暴露第一层拟合控制工具：增删/更新 source，改 fit window，改吸收 mask，改 continuum anchors/masks，请求 refit。
 - 把第一层工具调用保存成 `fit_control_patch`。
-- 把 patch 变成确定性的 fitter overrides，执行 refit，并记录 deterministic gate 决策；工具参数缺 required 字段、类型不对或 arguments 非 JSON 时直接失败，不记为有效 no-op。
+- 把 patch 变成确定性的 fitter overrides，执行 refit，并记录 deterministic gate 决策；工具参数缺 required 字段、类型不对、字符串数字、布尔数字或 arguments 非 JSON 时直接失败，不记为有效 no-op。
 - 多轮 loop 只传递状态和图像，不重新实现工具 schema 或 refit 逻辑。
-- 多轮 refit 可以继承累计 controls，但每轮 gate/edit profile 只按当前轮 patch 评估；assessment 阶段只允许通过 `request_more_budget` 申请下一轮，不执行 source/mask/window/continuum 编辑。
+- 多轮 refit 可以继承累计 controls；正常主线轮次的 gate/edit profile 只按当前轮 patch 评估。若上一轮 refit 被拒绝，下一轮会在显式 `trial_branch` 中试验累计候选 controls，并在 loop history 里记录 `evaluation_controls_scope`。assessment 阶段传给 provider 的 tool schema 只包含 `request_more_budget`，不执行 source/mask/window/continuum 编辑。
 - 把 review packet 压缩成 `fit_review` prompt messages，用于第二层结构复核。
 - 定义 provider-agnostic 的 `LLMClient` 协议。
 - 提供离线 client 和 OpenAI-compatible client。

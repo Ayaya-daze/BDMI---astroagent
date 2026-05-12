@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from base64 import b64encode
+import hashlib
 from importlib import resources
 from pathlib import Path
 import urllib.error
@@ -50,6 +51,14 @@ class LLMResult:
     model: str
     raw: dict[str, Any]
     tool_calls: list[dict[str, Any]] | None = None
+
+
+@dataclass(frozen=True)
+class FitControlPromptTemplates:
+    system_template: str = FIT_CONTROL_SYSTEM_PROMPT
+    user_template: str = FIT_CONTROL_USER_PROMPT
+    template_dir: str | Path | None = None
+    version: str | None = None
 
 
 class LLMClient(Protocol):
@@ -361,6 +370,7 @@ FIT_CONTROL_TOOLS: list[dict[str, Any]] = [
 def build_fit_control_messages(
     record: dict[str, Any],
     plot_image_path: str | Path | Sequence[str | Path] | None = None,
+    prompt_templates: FitControlPromptTemplates | None = None,
 ) -> list[LLMMessage]:
     fit_summary = record.get("fit_results", [{}])[0]
     prompt_payload = {
@@ -404,10 +414,12 @@ def build_fit_control_messages(
             },
         },
     }
-    system = _load_prompt_template(FIT_CONTROL_SYSTEM_PROMPT)
+    templates = prompt_templates or FitControlPromptTemplates()
+    system = _load_prompt_template(templates.system_template, template_dir=templates.template_dir)
     user_text = _render_prompt_template(
-        FIT_CONTROL_USER_PROMPT,
+        templates.user_template,
         payload=prompt_payload,
+        template_dir=templates.template_dir,
     )
     return [
         LLMMessage(role="system", content=system),
@@ -415,16 +427,37 @@ def build_fit_control_messages(
     ]
 
 
-def _load_prompt_template(name: str) -> str:
-    return resources.files("astroagent.agent.prompts").joinpath(name).read_text(encoding="utf-8").strip()
+def _load_prompt_template(name: str | Path, *, template_dir: str | Path | None = None) -> str:
+    if template_dir is not None:
+        return (Path(template_dir) / Path(name)).read_text(encoding="utf-8").strip()
+    return resources.files("astroagent.agent.prompts").joinpath(str(name)).read_text(encoding="utf-8").strip()
 
 
-def _render_prompt_template(name: str, *, payload: dict[str, Any]) -> str:
-    template = _load_prompt_template(name)
+def _render_prompt_template(name: str | Path, *, payload: dict[str, Any], template_dir: str | Path | None = None) -> str:
+    template = _load_prompt_template(name, template_dir=template_dir)
     payload_json = json.dumps(payload, ensure_ascii=False, indent=2)
-    if PROMPT_PAYLOAD_PLACEHOLDER not in template:
-        raise ValueError(f"prompt template {name} is missing {PROMPT_PAYLOAD_PLACEHOLDER}")
+    placeholder_count = template.count(PROMPT_PAYLOAD_PLACEHOLDER)
+    if placeholder_count != 1:
+        raise ValueError(f"prompt template {name} must contain exactly one {PROMPT_PAYLOAD_PLACEHOLDER}")
     return template.replace(PROMPT_PAYLOAD_PLACEHOLDER, payload_json)
+
+
+def _prompt_template_metadata(
+    templates: FitControlPromptTemplates,
+    *,
+    messages: list[LLMMessage],
+) -> dict[str, Any]:
+    system = str(messages[0].content) if messages else ""
+    user_content = messages[1].content if len(messages) > 1 else ""
+    user = _canonical_message_content(user_content)
+    return {
+        "system_template": str(templates.system_template),
+        "user_template": str(templates.user_template),
+        "template_dir": str(templates.template_dir) if templates.template_dir is not None else None,
+        "version": templates.version,
+        "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(),
+        "user_sha256": hashlib.sha256(user.encode("utf-8")).hexdigest(),
+    }
 
 
 def run_fit_control(
@@ -433,18 +466,37 @@ def run_fit_control(
     *,
     temperature: float = 0.0,
     plot_image_path: str | Path | Sequence[str | Path] | None = None,
+    prompt_templates: FitControlPromptTemplates | None = None,
+    allowed_tool_names: set[str] | None = None,
 ) -> dict[str, Any]:
+    templates = prompt_templates or FitControlPromptTemplates()
+    _validate_allowed_tool_names(allowed_tool_names)
+    tools = _fit_control_tools_for(allowed_tool_names)
+    messages = build_fit_control_messages(record, plot_image_path, prompt_templates=templates)
     result = client.complete(
-        build_fit_control_messages(record, plot_image_path),
+        messages,
         temperature=temperature,
-        tools=FIT_CONTROL_TOOLS,
+        tools=tools,
     )
+    filtered_tool_calls: list[dict[str, Any]] = []
     if result.tool_calls:
+        filtered_tool_calls = [
+            {"id": tool_call.get("id"), "name": _tool_call_name(tool_call)}
+            for tool_call in result.tool_calls
+            if allowed_tool_names is not None and _tool_call_name(tool_call) not in allowed_tool_names
+        ]
+        tool_calls = [
+            _normalize_tool_call(tool_call)
+            for tool_call in result.tool_calls
+            if allowed_tool_names is None or _tool_call_name(tool_call) in allowed_tool_names
+        ]
         control = {
             "task": "fit_control",
             "status": "tool_calls",
-            "tool_calls": [_normalize_tool_call(tool_call) for tool_call in result.tool_calls],
-            "rationale": "Model requested fitting tool calls.",
+            "tool_calls": tool_calls,
+            "rationale": "Model requested fitting tool calls."
+            if tool_calls
+            else "Model requested tool calls outside this step's allowed tool set.",
         }
     else:
         try:
@@ -453,10 +505,21 @@ def run_fit_control(
             raise ValueError(f"fit-control response is not valid JSON and had no tool calls: {result.content}") from exc
     if not isinstance(control, dict):
         raise ValueError("fit control response must be a JSON object")
+    filtered_content_tool_calls = _filter_disallowed_control_tool_calls(control, allowed_tool_names=allowed_tool_names)
+    if filtered_content_tool_calls and not control.get("tool_calls") and str(control.get("status", "")).strip().lower() in {
+        "tool_calls",
+        "tools",
+        "refit",
+    }:
+        control["rationale"] = "Model requested tool calls outside this step's allowed tool set."
     _normalize_fit_control_status(control)
     control.setdefault("rationale", "Model produced no rationale.")
-    validate_fit_control(control)
-    control["_llm_metadata"] = _llm_metadata(result)
+    validate_fit_control(control, allowed_tool_names=allowed_tool_names)
+    metadata = {**_llm_metadata(result), "prompt_templates": _prompt_template_metadata(templates, messages=messages)}
+    all_filtered_tool_calls = [*filtered_tool_calls, *filtered_content_tool_calls]
+    if all_filtered_tool_calls:
+        metadata["filtered_tool_calls"] = all_filtered_tool_calls
+    control["_llm_metadata"] = metadata
     return control
 
 
@@ -520,7 +583,7 @@ def _llm_metadata(result: LLMResult) -> dict[str, Any]:
     return metadata
 
 
-def validate_fit_control(control: dict[str, Any]) -> None:
+def validate_fit_control(control: dict[str, Any], *, allowed_tool_names: set[str] | None = None) -> None:
     missing = sorted(FIT_CONTROL_REQUIRED_KEYS - set(control))
     if missing:
         raise ValueError(f"fit control is missing required keys: {missing}")
@@ -530,11 +593,63 @@ def validate_fit_control(control: dict[str, Any]) -> None:
         raise ValueError("fit control status is invalid")
     if not isinstance(control["tool_calls"], list):
         raise ValueError("fit control tool_calls must be a list")
+    _validate_allowed_tool_names(allowed_tool_names)
     allowed_tools = {tool["function"]["name"] for tool in FIT_CONTROL_TOOLS}
+    if allowed_tool_names is not None:
+        allowed_tools &= set(allowed_tool_names)
     for tool_call in control["tool_calls"]:
         if tool_call.get("name") not in allowed_tools:
             raise ValueError(f"unknown fit-control tool: {tool_call.get('name')}")
         _validate_fit_control_tool_arguments(tool_call)
+
+
+def _validate_allowed_tool_names(allowed_tool_names: set[str] | None) -> None:
+    if allowed_tool_names is None:
+        return
+    if not allowed_tool_names:
+        raise ValueError("allowed fit-control tools must not be empty")
+    known = {tool["function"]["name"] for tool in FIT_CONTROL_TOOLS}
+    unknown = sorted(set(allowed_tool_names) - known)
+    if unknown:
+        raise ValueError(f"unknown allowed fit-control tools: {unknown}")
+
+
+def _fit_control_tools_for(allowed_tool_names: set[str] | None) -> list[dict[str, Any]]:
+    if allowed_tool_names is None:
+        return FIT_CONTROL_TOOLS
+    allowed = set(allowed_tool_names)
+    return [tool for tool in FIT_CONTROL_TOOLS if tool["function"]["name"] in allowed]
+
+
+def _filter_disallowed_control_tool_calls(
+    control: dict[str, Any],
+    *,
+    allowed_tool_names: set[str] | None,
+) -> list[dict[str, Any]]:
+    if allowed_tool_names is None:
+        return []
+    tool_calls = control.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return []
+    allowed = set(allowed_tool_names)
+    kept: list[Any] = []
+    filtered: list[dict[str, Any]] = []
+    for tool_call in tool_calls:
+        name = tool_call.get("name") if isinstance(tool_call, dict) else None
+        if name in allowed:
+            kept.append(tool_call)
+        else:
+            filtered.append({"id": tool_call.get("id") if isinstance(tool_call, dict) else None, "name": name})
+    control["tool_calls"] = kept
+    return filtered
+
+
+def _canonical_message_content(content: str | list[dict[str, Any]]) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return str(content)
 
 
 def _normalize_fit_control_status(control: dict[str, Any]) -> None:
@@ -1111,6 +1226,11 @@ def _normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _tool_call_name(tool_call: dict[str, Any]) -> Any:
+    function = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+    return function.get("name") or tool_call.get("name")
+
+
 def _validate_fit_control_tool_arguments(tool_call: dict[str, Any]) -> None:
     name = tool_call.get("name")
     arguments = tool_call.get("arguments")
@@ -1131,15 +1251,15 @@ def _validate_fit_control_tool_arguments(tool_call: dict[str, Any]) -> None:
         if key not in properties:
             continue
         expected = properties[key].get("type") if isinstance(properties[key], dict) else None
-        if expected == "number" and not _finite_number(value):
+        if expected == "number" and not _strict_finite_number(value):
             raise ValueError(f"fit-control tool {name} argument {key} must be a finite number")
         if expected == "integer":
-            try:
-                int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"fit-control tool {name} argument {key} must be an integer") from exc
-            if isinstance(value, float) and not value.is_integer():
+            if not _strict_integer(value):
                 raise ValueError(f"fit-control tool {name} argument {key} must be an integer")
+            if "minimum" in properties[key] and int(value) < int(properties[key]["minimum"]):
+                raise ValueError(f"fit-control tool {name} argument {key} must be >= {properties[key]['minimum']}")
+            if "maximum" in properties[key] and int(value) > int(properties[key]["maximum"]):
+                raise ValueError(f"fit-control tool {name} argument {key} must be <= {properties[key]['maximum']}")
         if expected == "string" and not isinstance(value, str):
             raise ValueError(f"fit-control tool {name} argument {key} must be a string")
         enum_values = properties[key].get("enum") if isinstance(properties[key], dict) else None
@@ -1153,6 +1273,14 @@ def _loads_first_json_object(text: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise json.JSONDecodeError("fit-control response must be a JSON object", text, 0)
     return payload
+
+
+def _strict_finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and _finite_number(value)
+
+
+def _strict_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _offline_fit_control_payload() -> dict[str, Any]:

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from astroagent.agent.fit_control import build_fit_control_patch
-from astroagent.agent.llm import OfflineReviewClient, OpenAICompatibleClient, run_fit_control, run_fit_review
+from astroagent.agent.llm import FitControlPromptTemplates, OfflineReviewClient, OpenAICompatibleClient, run_fit_control, run_fit_review
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -27,6 +27,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="LLM client to use. 'offline' is deterministic and does not call a network provider.",
     )
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--prompt-template-dir", type=Path, default=None, help="Directory containing fit_control_system.md and fit_control_user.md.")
+    parser.add_argument("--prompt-version", default=None, help="Optional label recorded in fit-control LLM metadata for prompt A/B runs.")
     return parser.parse_args(argv)
 
 
@@ -35,8 +37,19 @@ def main(argv: list[str] | None = None) -> None:
     record = json.loads(args.review_json.read_text(encoding="utf-8"))
     client = OfflineReviewClient() if args.client == "offline" else OpenAICompatibleClient()
     plot_image = args.plot_image or _default_plot_image(args.review_json, record)
+    prompt_templates = (
+        FitControlPromptTemplates(template_dir=args.prompt_template_dir, version=args.prompt_version)
+        if args.prompt_template_dir is not None or args.prompt_version is not None
+        else None
+    )
     if args.mode == "fit_control":
-        review = run_fit_control(record, client, temperature=args.temperature, plot_image_path=plot_image)
+        review = run_fit_control(
+            record,
+            client,
+            temperature=args.temperature,
+            plot_image_path=plot_image,
+            prompt_templates=prompt_templates,
+        )
         patch = build_fit_control_patch(review)
     else:
         review = run_fit_review(record, client, temperature=args.temperature, plot_image_path=plot_image)
