@@ -11,9 +11,12 @@ if str(SRC) not in sys.path:
 
 from astroagent.agent.fit_control import empty_fit_control_overrides, merge_fit_control_overrides
 from astroagent.agent.loop import (
+    _budget_only_patch,
     _candidate_score,
     _coerce_distinct_repeated_updates_to_adds,
+    _execute_candidate,
     _prepare_round_controls,
+    FitControlAgentState,
     run_fit_control_loop,
 )
 from astroagent.agent.llm import LLMResult, OfflineReviewClient
@@ -353,7 +356,9 @@ class FitControlLoopTest(unittest.TestCase):
 
         self.assertEqual(len(round_overrides["source_seeds"]), 1)
         self.assertNotIn("replace_component_index", round_overrides["source_seeds"][0])
-        self.assertEqual(len(effective_patch["tool_calls"]), 2)
+        self.assertEqual(len(effective_patch["tool_calls"]), 1)
+        self.assertEqual(effective_patch["tool_calls"][0]["name"], "add_absorption_source")
+        self.assertIn("applied_controls", effective_patch)
         replaced = [source for source in controls["source_seeds"] if "replace_component_index" in source]
         self.assertEqual(len(replaced), 1)
         self.assertEqual(replaced[0]["replace_component_index"], 0)
@@ -410,7 +415,87 @@ class FitControlLoopTest(unittest.TestCase):
 
         self.assertEqual(len(candidate_controls["continuum_mask_intervals_A"]), 1)
         self.assertEqual(len(candidate_controls["fit_mask_intervals"]), 1)
-        self.assertEqual([call["name"] for call in effective_patch["tool_calls"]], ["update_continuum_mask", "set_fit_mask_interval"])
+        self.assertEqual([call["name"] for call in candidate_controls["tool_calls"]], ["update_continuum_mask", "set_fit_mask_interval"])
+        self.assertEqual([call["name"] for call in effective_patch["tool_calls"]], ["set_fit_mask_interval"])
+
+    def test_candidate_gate_edit_profile_uses_current_round_controls_only(self):
+        record, window = self._demo_record_and_window()
+        transition_id = record["input"]["transitions"][0]["transition_line_id"]
+        active_controls = {
+            **empty_fit_control_overrides(),
+            "continuum_mask_intervals_A": [
+                {
+                    "start_wavelength_A": 5540.0,
+                    "end_wavelength_A": 5560.0,
+                    "mask_kind": "exclude",
+                    "reason": "previous rejected trial",
+                }
+            ],
+            "tool_calls": [
+                {
+                    "name": "update_continuum_mask",
+                    "arguments": {
+                        "start_wavelength_A": 5540.0,
+                        "end_wavelength_A": 5560.0,
+                        "mask_kind": "exclude",
+                        "reason": "previous rejected trial",
+                    },
+                }
+            ],
+        }
+        control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "current mask only",
+            "tool_calls": [
+                {
+                    "name": "set_fit_mask_interval",
+                    "arguments": {
+                        "transition_line_id": transition_id,
+                        "start_velocity_kms": 500.0,
+                        "end_velocity_kms": 575.0,
+                        "mask_kind": "exclude",
+                        "reason": "current round edge mask",
+                    },
+                }
+            ],
+        }
+        patch, round_overrides, candidate_controls, effective_patch = _prepare_round_controls(
+            record,
+            control,
+            active_controls,
+            round_index=2,
+        )
+        with tempfile.TemporaryDirectory(prefix="astroagent_loop_eval_controls_") as tmpdir:
+            candidate = _execute_candidate(
+                FitControlAgentState(record=record, image_paths=None, controls=active_controls),
+                window,
+                effective_patch,
+                candidate_controls,
+                round_overrides,
+                Path(tmpdir),
+                sample_id="eval_controls_demo_loop2",
+            )
+
+        edit_profile = candidate.evaluation["metrics"]["delta"]["edit_profile"]
+        self.assertEqual(edit_profile["continuum_edit_count"], 0)
+        self.assertEqual(edit_profile["fit_mask_window_edit_count"], 1)
+        self.assertFalse(edit_profile["continuum_changed"])
+
+    def test_assessment_patch_only_carries_budget_request(self):
+        patch = {
+            "task": "fit_control_patch",
+            "tool_calls": [
+                {"name": "request_more_budget", "arguments": {"requested_rounds": 1, "next_experiment": "inspect", "reason": "needed"}},
+                {"name": "add_absorption_source", "arguments": {"transition_line_id": "CIV_1548", "center_velocity_kms": 10.0, "reason": "not in assessment"}},
+            ],
+            "requires_refit": True,
+        }
+
+        budget_patch = _budget_only_patch(patch)
+
+        self.assertFalse(budget_patch["requires_refit"])
+        self.assertEqual([call["name"] for call in budget_patch["tool_calls"]], ["request_more_budget"])
 
     def test_candidate_score_penalizes_core_mask_more_than_context_mask(self):
         base = {

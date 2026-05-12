@@ -569,8 +569,8 @@ def build_fit_control_messages(
         "Do not call request_refit by itself; pair it with a concrete edit. "
         "The loop has an initial experiment budget. After you have seen refit feedback, you may call request_more_budget "
         "when one more concrete experiment is justified by the latest result. request_more_budget is not a refit request; "
-        "pair it with a concrete edit if you already know the next action, or use it alone only when the next call needs to "
-        "inspect the latest feedback before editing. The harness may approve extra rounds up to its hard cap. "
+        "it only asks the harness to allow another decision round. Do not pair request_more_budget with source, mask, window, "
+        "or continuum edits in the same assessment response; make those edits in the next decision round. The harness may approve extra rounds up to its hard cap. "
         "If no edit is safe, return JSON with task='fit_control', "
         "status='no_action', tool_calls=[], and a rationale.\n\n"
         + json.dumps(prompt_payload, ensure_ascii=False, indent=2)
@@ -688,6 +688,7 @@ def validate_fit_control(control: dict[str, Any]) -> None:
     for tool_call in control["tool_calls"]:
         if tool_call.get("name") not in allowed_tools:
             raise ValueError(f"unknown fit-control tool: {tool_call.get('name')}")
+        _validate_fit_control_tool_arguments(tool_call)
 
 
 def _normalize_fit_control_status(control: dict[str, Any]) -> None:
@@ -1253,8 +1254,8 @@ def _normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     if isinstance(arguments_raw, str):
         try:
             arguments = json.loads(arguments_raw)
-        except json.JSONDecodeError:
-            arguments = {"_raw_arguments": arguments_raw}
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON arguments for tool call {name}") from exc
     else:
         arguments = arguments_raw
     return {
@@ -1262,6 +1263,42 @@ def _normalize_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
         "name": name,
         "arguments": arguments,
     }
+
+
+def _validate_fit_control_tool_arguments(tool_call: dict[str, Any]) -> None:
+    name = tool_call.get("name")
+    arguments = tool_call.get("arguments")
+    if not isinstance(arguments, dict):
+        raise ValueError(f"fit-control tool arguments must be an object for {name}")
+    schema = next((tool["function"]["parameters"] for tool in FIT_CONTROL_TOOLS if tool["function"]["name"] == name), None)
+    if not isinstance(schema, dict):
+        raise ValueError(f"unknown fit-control tool: {name}")
+    required = schema.get("required", [])
+    if isinstance(required, list):
+        missing = [key for key in required if key not in arguments]
+        if missing:
+            raise ValueError(f"fit-control tool {name} missing required arguments: {missing}")
+    properties = schema.get("properties", {})
+    if not isinstance(properties, dict):
+        return
+    for key, value in arguments.items():
+        if key not in properties:
+            continue
+        expected = properties[key].get("type") if isinstance(properties[key], dict) else None
+        if expected == "number" and not _finite_number(value):
+            raise ValueError(f"fit-control tool {name} argument {key} must be a finite number")
+        if expected == "integer":
+            try:
+                int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"fit-control tool {name} argument {key} must be an integer") from exc
+            if isinstance(value, float) and not value.is_integer():
+                raise ValueError(f"fit-control tool {name} argument {key} must be an integer")
+        if expected == "string" and not isinstance(value, str):
+            raise ValueError(f"fit-control tool {name} argument {key} must be a string")
+        enum_values = properties[key].get("enum") if isinstance(properties[key], dict) else None
+        if isinstance(enum_values, list) and value not in enum_values:
+            raise ValueError(f"fit-control tool {name} argument {key} must be one of {enum_values}")
 
 
 def _loads_first_json_object(text: str) -> dict[str, Any]:

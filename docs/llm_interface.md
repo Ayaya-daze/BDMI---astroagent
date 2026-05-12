@@ -178,6 +178,8 @@ outputs/review_packet/demo_CIV_doublet_z2p6000.fit_control_patch.json
 这些统一入口会从 `sample_id` 自动推断同目录的 `*.window.csv`、`*.overview.png` 和 `*.plot.png`；旧的 `scripts/*.py` 包装入口仍然保留给未安装包的本地开发。
 `--max-rounds` 是初始完整实验轮预算；每轮包含一次 agent 决策、一次确定性 refit/gate、一次 agent assessment。assessment 会看到本轮刚生成的 refit feedback，并可通过 `request_more_budget` 申请进入下一轮；`--hard-max-rounds` 是绝对上限。loop 结束后会额外生成 `<sample_id>.audit/audit_report.md` 和 `audit_report.json`。报告只汇总已有 loop 历史、fit metrics 和 gate 信号，不替代人工科学裁决。
 
+工具调用会在 LLM 边界和 patch 边界做 required/type/enum 校验；缺字段、非 JSON arguments 或非有限数值会直接失败，不会记录为 `validated` 的 no-op。refit 可以继承累计 controls，但 deterministic gate 的 edit profile 只按当前轮 patch 计数，避免上一轮工具动作污染本轮评估。assessment 阶段只消费 `request_more_budget`；如果模型同时输出 source/mask/window/continuum 编辑，这些编辑不会执行，必须在获批后的下一轮 decision call 中重新提出。
+
 `fit_control_loop` 的停止原因包括：
 
 - `no_refit_requested`：模型没有请求任何会改变拟合输入的工具；单独 `request_refit` 不算有效编辑。

@@ -209,10 +209,16 @@ def refit_record_with_overrides(
     overrides: dict[str, Any],
     *,
     sample_id: str | None = None,
+    evaluation_overrides: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Apply already-canonical fit-control overrides and rerun the fit."""
     original_fit = _primary_fit(record)
     controlled_overrides = _with_controlled_source_seeds(original_fit, overrides)
+    controlled_evaluation_overrides = (
+        _with_controlled_source_seeds(original_fit, evaluation_overrides)
+        if evaluation_overrides is not None
+        else controlled_overrides
+    )
     refit_record = build_review_record_from_window(
         window=window,
         window_metadata=record["input"],
@@ -221,7 +227,7 @@ def refit_record_with_overrides(
         fit_control=controlled_overrides,
     )
     refit_fit = _primary_fit(refit_record)
-    evaluation = evaluate_refit_patch(original_fit, refit_fit, controlled_overrides)
+    evaluation = evaluate_refit_patch(original_fit, refit_fit, controlled_evaluation_overrides)
     applied_patch = deepcopy(patch)
     applied_patch["applied"] = True
     applied_patch["accepted"] = bool(evaluation["accepted"])
@@ -741,6 +747,7 @@ def _normalize_patch_call(call: dict[str, Any], *, index: int) -> dict[str, Any]
     arguments = call.get("arguments", {})
     if not isinstance(arguments, dict):
         raise ValueError(f"fit-control tool arguments must be an object for {name}")
+    _validate_patch_call_arguments(name, arguments)
     return {
         "sequence_index": int(index),
         "id": call.get("id"),
@@ -748,6 +755,62 @@ def _normalize_patch_call(call: dict[str, Any], *, index: int) -> dict[str, Any]
         "arguments": arguments,
         "validated": True,
     }
+
+
+def _validate_patch_call_arguments(name: str, arguments: dict[str, Any]) -> None:
+    required_by_tool = {
+        "add_absorption_source": {"transition_line_id", "center_velocity_kms", "reason"},
+        "remove_absorption_source": {"component_index", "reason"},
+        "update_absorption_source": {"component_index", "reason"},
+        "set_fit_mask_interval": {"transition_line_id", "start_velocity_kms", "end_velocity_kms", "mask_kind", "reason"},
+        "set_fit_window": {"transition_line_id", "reason"},
+        "request_refit": {"reason"},
+        "request_more_budget": {"requested_rounds", "next_experiment", "reason"},
+        "add_continuum_anchor": {"wavelength_A", "reason"},
+        "remove_continuum_anchor": {"anchor_index", "reason"},
+        "update_continuum_mask": {"start_wavelength_A", "end_wavelength_A", "mask_kind", "reason"},
+    }
+    missing = sorted(required_by_tool.get(name, set()) - set(arguments))
+    if missing:
+        raise ValueError(f"fit-control tool {name} missing required arguments: {missing}")
+    numeric_keys = {
+        "center_velocity_kms",
+        "center_prior_sigma_kms",
+        "center_prior_half_width_kms",
+        "logN",
+        "logN_lower",
+        "logN_upper",
+        "b_kms",
+        "b_kms_lower",
+        "b_kms_upper",
+        "start_velocity_kms",
+        "end_velocity_kms",
+        "transition_half_width_kms",
+        "local_fit_half_width_kms",
+        "wavelength_A",
+        "continuum_flux",
+        "start_wavelength_A",
+        "end_wavelength_A",
+    }
+    for key in numeric_keys & set(arguments):
+        if not _finite(arguments.get(key)):
+            raise ValueError(f"fit-control tool {name} argument {key} must be a finite number")
+    for key in {"component_index", "anchor_index", "requested_rounds"} & set(arguments):
+        try:
+            parsed = int(arguments.get(key))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"fit-control tool {name} argument {key} must be an integer") from exc
+        if isinstance(arguments.get(key), float) and not float(arguments[key]).is_integer():
+            raise ValueError(f"fit-control tool {name} argument {key} must be an integer")
+        if key == "requested_rounds" and parsed < 1:
+            raise ValueError("fit-control tool request_more_budget argument requested_rounds must be >= 1")
+    if arguments.get("mask_kind") is not None and arguments.get("mask_kind") not in {"include", "exclude"}:
+        raise ValueError(f"fit-control tool {name} argument mask_kind must be include or exclude")
+    if arguments.get("sibling_mask_mode") is not None and arguments.get("sibling_mask_mode") not in {"exclude", "allow_overlap"}:
+        raise ValueError(f"fit-control tool {name} argument sibling_mask_mode must be exclude or allow_overlap")
+    for key in {"transition_line_id", "reason", "next_experiment"} & set(arguments):
+        if not isinstance(arguments.get(key), str):
+            raise ValueError(f"fit-control tool {name} argument {key} must be a string")
 
 
 def _requires_refit(tool_calls: list[dict[str, Any]]) -> bool:

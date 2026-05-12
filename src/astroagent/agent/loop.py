@@ -178,6 +178,7 @@ def run_fit_control_loop(
             window,
             effective_patch,
             candidate_controls,
+            round_overrides,
             output_path,
             sample_id=refit_sample_id,
         )
@@ -208,8 +209,10 @@ def run_fit_control_loop(
         )
         round_entry["assessment_control"] = assessment_control
         round_entry["assessment_summary"] = assessment_control.get("rationale")
-        budget_patch = assessment_patch
-        round_entry["budget_request"] = _budget_request_from_patch(assessment_patch)
+        budget_patch = _budget_only_patch(assessment_patch)
+        if budget_patch != assessment_patch:
+            round_entry["assessment_ignored_tool_calls"] = _non_budget_tool_calls(assessment_patch)
+        round_entry["budget_request"] = _budget_request_from_patch(budget_patch)
         budget_decision = _decide_budget_request(
             budget_patch,
             round_index=round_index,
@@ -464,6 +467,29 @@ def _budget_request_from_patch(patch: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _budget_only_patch(patch: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(patch, dict):
+        return {"tool_calls": []}
+    updated = deepcopy(patch)
+    updated["tool_calls"] = [
+        call
+        for call in patch.get("tool_calls", [])
+        if isinstance(call, dict) and call.get("name") == "request_more_budget"
+    ]
+    updated["requires_refit"] = False
+    return updated
+
+
+def _non_budget_tool_calls(patch: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(patch, dict):
+        return []
+    return [
+        call
+        for call in patch.get("tool_calls", [])
+        if isinstance(call, dict) and call.get("name") != "request_more_budget"
+    ]
+
+
 def _decide_budget_request(
     patch: dict[str, Any],
     *,
@@ -542,9 +568,15 @@ def _prepare_round_controls(
     round_overrides = build_fit_control_overrides(record, patch)
     candidate_controls = merge_fit_control_overrides(active_controls, round_overrides)
     effective_patch = deepcopy(patch)
-    effective_patch["tool_calls"] = deepcopy(candidate_controls.get("tool_calls", []))
+    effective_patch["applied_controls"] = _public_fit_control_controls(candidate_controls)
     effective_patch["requires_refit"] = bool(patch.get("requires_refit"))
     return patch, round_overrides, candidate_controls, effective_patch
+
+
+def _public_fit_control_controls(controls: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(controls)
+    public.pop("tool_calls", None)
+    return public
 
 
 def _execute_candidate(
@@ -552,6 +584,7 @@ def _execute_candidate(
     window: pd.DataFrame,
     patch: dict[str, Any],
     controls: dict[str, Any],
+    evaluation_controls: dict[str, Any],
     output_path: Path,
     *,
     sample_id: str,
@@ -562,6 +595,7 @@ def _execute_candidate(
         patch,
         controls,
         sample_id=sample_id,
+        evaluation_overrides=evaluation_controls,
     )
     evaluation = record.get("fit_control_evaluation", {})
     decision = str(evaluation.get("decision", "unknown"))

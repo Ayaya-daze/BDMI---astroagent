@@ -283,6 +283,44 @@ class LLMInterfaceTest(unittest.TestCase):
 
         self.assertFalse(patch["requires_refit"])
 
+    def test_build_fit_control_patch_rejects_missing_required_tool_arguments(self):
+        control = {
+            "task": "fit_control",
+            "status": "tool_calls",
+            "rationale": "bad source",
+            "tool_calls": [
+                {
+                    "name": "add_absorption_source",
+                    "arguments": {"transition_line_id": "CIV_1548", "reason": "missing center"},
+                }
+            ],
+        }
+
+        with self.assertRaisesRegex(ValueError, "missing required arguments"):
+            build_fit_control_patch(control, source="unit")
+
+    def test_run_fit_control_rejects_invalid_provider_tool_json(self):
+        class BadToolJsonClient:
+            def complete(self, messages, *, temperature=0.0, tools=None):
+                return LLMResult(
+                    content="",
+                    model="unit-bad-tool-json",
+                    raw={"unit": True},
+                    tool_calls=[
+                        {
+                            "id": "call_bad",
+                            "type": "function",
+                            "function": {
+                                "name": "add_absorption_source",
+                                "arguments": "{not-json",
+                            },
+                        }
+                    ],
+                )
+
+        with self.assertRaisesRegex(ValueError, "invalid JSON arguments"):
+            run_fit_control(self._demo_record(), BadToolJsonClient())
+
     def test_append_and_summarize_pending_fit_control_patches(self):
         record = {"sample_id": "patch_demo", "human_review": {}}
         control = {
