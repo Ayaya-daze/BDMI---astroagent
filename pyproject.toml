@@ -37,6 +37,9 @@ astroagent-run-fit-control-loop = "astroagent.cli.run_fit_control_loop:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+astroagent = ["agent/prompts/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

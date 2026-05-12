@@ -58,6 +58,7 @@
 
 - `src/astroagent/agent/llm.py`
   - `build_fit_control_messages(record, plot_image_path=None)`：把 review packet 压缩成 fit-control messages，可附带图像。
+  - `fit_control` 的长 prompt 不写在 Python 里，而是从 `src/astroagent/agent/prompts/fit_control_system.md` 和 `src/astroagent/agent/prompts/fit_control_user.md` 读取；user 模板用 `{{PROMPT_PAYLOAD_JSON}}` 标记结构化上下文插入位置，方便 harness 后续替换或版本化 prompt。
   - `run_fit_control(record, client, plot_image_path=None)`：调用 client，解析 tool calls / JSON，并做最小 schema 检查。
   - `build_fit_review_messages(record, plot_image_path=None)`：把 review packet 压缩成复核 messages。
   - `run_fit_review(record, client, plot_image_path=None)`：调用 client，解析 JSON，并做最小 schema 检查。

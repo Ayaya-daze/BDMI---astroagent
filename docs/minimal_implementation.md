@@ -104,6 +104,7 @@ outputs/review_packet/
 
 - 把 review packet 压缩成 `fit_control` prompt messages，并可附带 `*.plot.png`。
 - `fit_control` prompt 只传决策摘要，不传完整 per-pixel residual arrays、完整 posterior detail 或 provider raw payload；完整数据仍保存在 review JSON/CSV artifact。
+- `fit_control` prompt 正文在 `src/astroagent/agent/prompts/*.md`，Python 只加载模板并注入 `{{PROMPT_PAYLOAD_JSON}}`。
 - 暴露第一层拟合控制工具：增删/更新 source，改 fit window，改吸收 mask，改 continuum anchors/masks，请求 refit。
 - 把第一层工具调用保存成 `fit_control_patch`。
 - 把 patch 变成确定性的 fitter overrides，执行 refit，并记录 deterministic gate 决策；工具参数缺 required 字段、类型不对或 arguments 非 JSON 时直接失败，不记为有效 no-op。

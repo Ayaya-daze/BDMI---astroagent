@@ -32,6 +32,7 @@ from astroagent.agent.llm import (
     OfflineReviewClient,
     build_fit_control_messages,
     _chat_completions_url,
+    _load_prompt_template,
     run_fit_review,
     run_fit_control,
 )
@@ -81,6 +82,20 @@ class LLMInterfaceTest(unittest.TestCase):
             source={"kind": "unit_test"},
         )
         return record
+
+    def test_fit_control_prompt_is_loaded_from_markdown_template(self):
+        template = _load_prompt_template("fit_control_user.md")
+        self.assertIn("{{PROMPT_PAYLOAD_JSON}}", template)
+        self.assertIn("Task: fit_control", template)
+
+        messages = build_fit_control_messages(self._demo_record())
+        text = messages[1].content
+
+        self.assertIsInstance(text, str)
+        self.assertTrue(text.startswith("Task: fit_control. Inspect"))
+        self.assertIn("## Structured Context", text)
+        self.assertNotIn("{{PROMPT_PAYLOAD_JSON}}", text)
+        self.assertIn("\"sample_id\"", text)
 
     def test_fit_control_messages_can_include_plot_image(self):
         record = self._demo_record()
